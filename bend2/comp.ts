@@ -5453,10 +5453,10 @@ static void gpu_load(u64 bytes) {
 }
 
 static void gpu_copy(u64 lo, u64 hi, bool up) {
-  u64 t0 = gpu_stat ? io_tick() : 0;
   if (hi <= lo) {
     return;
   }
+  u64 t0 = gpu_stat ? io_tick() : 0;
   if (hipMemcpy(up ? (void*)(gpu_vram + lo) : (void*)(CORPUS + lo),
     up ? (void*)(CORPUS + lo) : (void*)(gpu_vram + lo), (hi - lo) * 8,
     up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) != hipSuccess) {
