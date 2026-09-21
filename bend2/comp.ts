@@ -5619,8 +5619,7 @@ static void gpu_show(Term image, u32 w, u32 h, u32 k, u32* pix) {
     err_fail("cannot load the window kernel");
   }
   if (len > cap) {
-    hipFree(buf);
-    if (hipMalloc(&buf, len) != hipSuccess) {
+    if (hipFree(buf) != hipSuccess || hipMalloc(&buf, len) != hipSuccess) {
       err_fail("the frame's device buffer failed");
     }
     cap = len;
