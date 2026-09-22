@@ -4888,10 +4888,18 @@ static void* pool_mmap(u64 bytes) {
 #if BEND_HIP
 // gpu_fault calls into HIP, so the signal stack is a real one
 #define TRAP_STK (1u << 20)
-static bool gpu_fault(void* addr);
+static bool gpu_fault(void* addr, bool wr);
 
+// x86-64 says whether the access was a write (the page fault's error code);
+// elsewhere a fault on a clean chunk is taken for one
 static void gpu_trap(int sig, siginfo_t* si, void* uc) {
-  if (!gpu_fault(si->si_addr)) {
+#ifdef __x86_64__
+  bool wr = sig != SIGSEGV
+    || (((ucontext_t*)uc)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+#else
+  bool wr = true;
+#endif
+  if (!gpu_fault(si->si_addr, wr)) {
     err_trap(sig);
   }
 }
@@ -5316,13 +5324,19 @@ static bool gpu_probe(void) {
 }
 
 // The twin's heap is lazy. After a device turn a chunk under the bump is
-// stale: no access, until a host touch downloads it and marks it dirty; a
-// turn uploads the dirty ones. The bump cannot say what the host wrote:
-// heap_free and heap_alloc rewrite freed slots under it. A fault fills a
-// chunk through gpu_alias, a second mapping, while the chunk still traps,
-// so no other host thread sees it half filled.
+// stale: no access, the device's copy is the one. A host touch downloads it
+// and leaves it clean: read only, the same bytes as the device's. A write
+// to a clean chunk makes it dirty: read-write, and a turn uploads the dirty
+// ones, so a chunk the host only read does not go back up. The bump cannot
+// say what the host wrote: heap_free and heap_alloc rewrite freed slots
+// under it. A fault fills a chunk through gpu_alias, a second mapping,
+// while the chunk still traps, so no other host thread sees it half
+// filled. A chunk no turn has left behind yet is dirty, as it always was.
 #define GPU_CHUNK (1ull << 18)
-static u8*   gpu_stale;       // a flag a tracked chunk; 0 is dirty
+#define GPU_DIRTY 0
+#define GPU_STALE 1
+#define GPU_CLEAN 2
+static u8*   gpu_state;       // a GPU_ state a tracked chunk; calloc is dirty
 static char* gpu_alias;
 static u64   gpu_lo, gpu_hi;  // the tracked bytes of the corpus, whole chunks
 static u32   gpu_fault_lock;
@@ -5331,6 +5345,7 @@ static u32   gpu_fault_lock;
 static bool gpu_stat;
 static u32  gpu_part;  // 0 header, 1 rings, 2 heap, 3 banks
 static u64  gpu_turns, gpu_faults, gpu_dev_ns;
+static u64  gpu_writes, gpu_served, gpu_sent;  // clean to dirty; chunks up
 static u64  gpu_calls[4][2], gpu_bytes[4][2], gpu_ns[4][2];
 static u64  io_tick(void);
 
@@ -5342,9 +5357,13 @@ static void gpu_tally(u32 k, bool up, u64 bytes, u64 t0) {
 
 static void gpu_stats(void) {
   static const char* part[4] = { "header", "rings ", "heap  ", "banks " };
-  fprintf(stderr, "bend: hip %llu turns, passes %llu us, %llu chunk faults\n",
-    (unsigned long long)gpu_turns, (unsigned long long)(gpu_dev_ns / 1000),
-    (unsigned long long)gpu_faults);
+  fprintf(stderr, "bend: hip %llu turns, passes %llu us, %llu chunk faults"
+    ", %llu clean to dirty, %llu served already, %llu chunks up (%llu a turn)"
+    "\n", (unsigned long long)gpu_turns,
+    (unsigned long long)(gpu_dev_ns / 1000), (unsigned long long)gpu_faults,
+    (unsigned long long)gpu_writes, (unsigned long long)gpu_served,
+    (unsigned long long)gpu_sent,
+    (unsigned long long)(gpu_sent / (gpu_turns ? gpu_turns : 1)));
   for (u32 k = 0; k < 4; k += 1) {
     fprintf(stderr, "bend: hip   %s", part[k]);
     for (u32 up = 2; up-- > 0;) {
@@ -5496,13 +5515,13 @@ static void gpu_rings(bool up) {
 // the whole ones within the heap; what lies outside them goes eagerly.
 static void gpu_heap(u64 end, bool up) {
   Corpus H = CORPUS;
-  if (gpu_stale == NULL) {
+  if (gpu_state == NULL) {
     u64 cap = a32_load(a32_at(H, H_CAP));
     gpu_lo = (HEAP_OFF * 8 + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
     gpu_hi = ((HEAP_OFF + (cap << PAGE_BITS)) * 8) & ~(GPU_CHUNK - 1);
     gpu_hi = gpu_hi < gpu_lo ? gpu_lo : gpu_hi;
-    gpu_stale = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
-    if (gpu_stale == NULL) {
+    gpu_state = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
+    if (gpu_state == NULL) {
       err_fail("corpus reservation failed");
     }
   }
@@ -5516,9 +5535,10 @@ static void gpu_heap(u64 end, bool up) {
   u64 n = (te - gpu_lo) / GPU_CHUNK;
   for (u64 c = 0; up && c < n; c += 1) {
     u64 lo = c;
-    while (c < n && !gpu_stale[c]) {
+    while (c < n && gpu_state[c] == GPU_DIRTY) {
       c += 1;
     }
+    gpu_sent += c - lo;
     gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + c * GPU_CHUNK) / 8, up);
   }
   if (!up && n != 0) {
@@ -5526,14 +5546,17 @@ static void gpu_heap(u64 end, bool up) {
     if (mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
       err_fail("corpus protection failed");
     }
-    memset(gpu_stale, 1, n);
+    memset(gpu_state, GPU_STALE, n);
     UNLOCK(gpu_fault_lock);
   }
 }
 
-static bool gpu_fault(void* addr) {
+// Stale: download, read only, clean; a write faults again. Clean: a write,
+// so read-write and dirty; or a read that trapped while the chunk was stale
+// and another thread served it, as dirty is.
+static bool gpu_fault(void* addr, bool wr) {
   u64 off = (u64)((char*)addr - (char*)CORPUS);
-  if (gpu_stale == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
+  if (gpu_state == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
     || off >= gpu_hi) {
     return false;
   }
@@ -5541,16 +5564,22 @@ static bool gpu_fault(void* addr) {
   u64  at = gpu_lo + c * GPU_CHUNK;
   bool ok = true;
   LOCK(gpu_fault_lock);
-  if (gpu_stale[c]) {
+  if (gpu_state[c] == GPU_STALE) {
     u64 t0 = gpu_stat ? io_tick() : 0;
     ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
       hipMemcpyDeviceToHost) == hipSuccess
-      && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ | PROT_WRITE) == 0;
-    gpu_stale[c] = !ok;
+      && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ) == 0;
+    gpu_state[c] = ok ? GPU_CLEAN : GPU_STALE;
     if (gpu_stat) {
       gpu_faults += 1;
       gpu_tally(2, false, GPU_CHUNK, t0);
     }
+  } else if (gpu_state[c] == GPU_CLEAN && wr) {
+    ok = mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ | PROT_WRITE) == 0;
+    gpu_state[c] = ok ? GPU_DIRTY : GPU_CLEAN;
+    gpu_writes  += ok;
+  } else {
+    gpu_served += 1;
   }
   UNLOCK(gpu_fault_lock);
   return ok;
