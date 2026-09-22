@@ -14,6 +14,7 @@ if [[ ${CPU_ONLY:-0} == 1 ]]; then
 fi
 cd "$root"
 { git rev-parse HEAD; git status --short; uname -a; "$CC" --version
+  echo "HSA_ENABLE_DXG_DETECTION=${HSA_ENABLE_DXG_DETECTION:-unset} LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-unset}"
   sha256sum demos/app_particles_2d/{main.bend,clock.c} bend2/{bend.ts,comp.ts,base.bend} demos/app_slash_boss_3d/bend3d.bend
 } > "$out/environment.txt"
 bun bend2/main.ts demos/app_particles_2d/PROOF.bend --check-only > "$out/proof.log" 2>&1

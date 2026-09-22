@@ -5,6 +5,13 @@ particle lists, then rasterize host-binned sprites using the sibling Bend3D
 renderer. It intentionally tests SHADERS.md's warning about two bangs/frame.
 The fixed scalar attractors make it nbody-shaped, not an all-pairs nbody model.
 
+On this machine the HIP lane only finds the card with:
+
+```sh
+export HSA_ENABLE_DXG_DETECTION=1
+export LD_LIBRARY_PATH=/home/costamatheus97/vt/brainstorm-ai/hip-probe/rocdxg/lib
+```
+
 Build from the worktree:
 
 ```sh

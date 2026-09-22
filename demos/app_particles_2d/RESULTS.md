@@ -1,4 +1,4 @@
-# CPU validation; GPU measurement pending
+# CPU validation; GPU results in perf/sim-raster/GPU-RESULTS.md
 
 2026-09-22, Ryzen 7 5800XT / WSL2, 16 CPU workers, ROCm Clang 22 `-O3`,
 1024x768 output. Three runs per scale, each 8 warmups + 24 measured frames.
@@ -51,15 +51,12 @@ Build/proof runner logs: `logs/cpu-runner-check/`. Ownership: `logs/implementati
 Synthetic runner tests reject wrong turns, checksum mismatches, process failures,
 wrong/duplicate reports, missing stats and missing/duplicate copy regions.
 
-No GPU device is exposed to this sandbox. GPU compilation/execution, actual
-turn counts, device/copy timings, and CPU/GPU checksum equality are unverified.
-Window mode compiles; no visual inspection was performed. The host command is
-`bash "$P/run-gpu.sh"`; it requires successful GPU runs and exactly 2 turns per
-executed frame, including warmups. Fused is omitted for the host dependency
-explained in README.md. Confidence is high in CPU behavior; GPU performance
-and exact F32 agreement remain open until that host run succeeds.
+GPU runs were done later on the host (RX 7800 XT, WSL2): 2 turns/frame at every
+scale, pixel and state checksums identical to the CPU lane, and the GPU lane
+slower end to end (3.35x at 16K, 1.99x at 64K, 1.20x at 256K), copy-bound. Full
+tables, device/copy stats and reading: `perf/sim-raster/GPU-RESULTS.md`; raw logs
+`perf/sim-raster/logs/gpu-2/`. Window mode compiles; no visual inspection. Fused
+is omitted for the host dependency explained in README.md.
 
-Git metadata is read-only in this sandbox, so no commit SHA was created.
-The repo gate and diff check use a disposable candidate index/object directory
-under /tmp, including all eight demo files. The host can run `bash "$P/commit.sh"`
-to stage only this demo, recheck the gate, and commit on hip-sim-raster (no push).
+The card is only visible with `HSA_ENABLE_DXG_DETECTION=1` and the rocdxg shim on
+`LD_LIBRARY_PATH` (README.md).
