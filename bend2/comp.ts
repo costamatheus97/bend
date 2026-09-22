@@ -5551,9 +5551,11 @@ static void gpu_heap(u64 end, bool up) {
   }
 }
 
-// Stale: download, read only, clean; a write faults again. Clean: a write,
-// so read-write and dirty; or a read that trapped while the chunk was stale
-// and another thread served it, as dirty is.
+// Stale: download under the lock, read only, clean; a write faults again.
+// Clean and a write: read-write, then dirty, with no lock: no bytes move,
+// two writers make the same change, and a download of another chunk would
+// hold them for its copy. Anything else trapped while the chunk was stale
+// and another thread served it.
 static bool gpu_fault(void* addr, bool wr) {
   u64 off = (u64)((char*)addr - (char*)CORPUS);
   if (gpu_state == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
@@ -5562,26 +5564,36 @@ static bool gpu_fault(void* addr, bool wr) {
   }
   u64  c  = (off - gpu_lo) / GPU_CHUNK;
   u64  at = gpu_lo + c * GPU_CHUNK;
+  u8*  st = &gpu_state[c];
+  u8   s  = __atomic_load_n(st, __ATOMIC_ACQUIRE);
   bool ok = true;
-  LOCK(gpu_fault_lock);
-  if (gpu_state[c] == GPU_STALE) {
-    u64 t0 = gpu_stat ? io_tick() : 0;
-    ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
-      hipMemcpyDeviceToHost) == hipSuccess
-      && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ) == 0;
-    gpu_state[c] = ok ? GPU_CLEAN : GPU_STALE;
-    if (gpu_stat) {
-      gpu_faults += 1;
-      gpu_tally(2, false, GPU_CHUNK, t0);
-    }
-  } else if (gpu_state[c] == GPU_CLEAN && wr) {
+  if (s == GPU_CLEAN && wr) {
     ok = mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ | PROT_WRITE) == 0;
-    gpu_state[c] = ok ? GPU_DIRTY : GPU_CLEAN;
-    gpu_writes  += ok;
-  } else {
-    gpu_served += 1;
+    if (ok) {
+      __atomic_store_n(st, GPU_DIRTY, __ATOMIC_RELEASE);
+      __atomic_fetch_add(&gpu_writes, 1, __ATOMIC_RELAXED);
+    }
+    return ok;
   }
-  UNLOCK(gpu_fault_lock);
+  if (s == GPU_STALE) {
+    LOCK(gpu_fault_lock);
+    s = __atomic_load_n(st, __ATOMIC_RELAXED);
+    if (s == GPU_STALE) {
+      u64 t0 = gpu_stat ? io_tick() : 0;
+      ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
+        hipMemcpyDeviceToHost) == hipSuccess
+        && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ) == 0;
+      __atomic_store_n(st, ok ? GPU_CLEAN : GPU_STALE, __ATOMIC_RELEASE);
+      if (gpu_stat) {
+        gpu_faults += 1;
+        gpu_tally(2, false, GPU_CHUNK, t0);
+      }
+    }
+    UNLOCK(gpu_fault_lock);
+  }
+  if (s != GPU_STALE) {
+    __atomic_fetch_add(&gpu_served, 1, __ATOMIC_RELAXED);
+  }
   return ok;
 }
 
