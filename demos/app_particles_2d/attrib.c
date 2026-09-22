@@ -179,6 +179,7 @@ static bool at_fault(u64 c, void* addr, u32 how) {
   if (at_dcmp) {
     at_diff_add(at_diff[1][r], (const u8*)at_buf + GPU_CHUNK, now);
   }
+  wr_fault(c, how, r);
   return true;
 }
 
@@ -262,6 +263,7 @@ static void at_enter(void) {
   hipMemcpy(at_dev, (char*)gpu_vram + gpu_lo, n * GPU_CHUNK,
     hipMemcpyDeviceToDevice);
   at_arg_walk();
+  wr_enter(n);
   for (Cls c = 0; c < NCLS_ALL; c += 1) {
     Bank* b = bank_at(H, c);
     at_snap[c]  = realloc(at_snap[c], (b->rd + 1) * 8ull);
@@ -304,5 +306,6 @@ static void at_leave(void) {
   }
   free(old);
   at_reach_walk(H);
+  wr_leave();
 }
 #endif

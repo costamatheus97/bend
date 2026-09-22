@@ -1,7 +1,8 @@
 #!/bin/bash
 # Stage 1 fault attribution on the HIP lane (a measurement build, not the
 # runtime): emit the probe's C, splice attrib.c's phase tags and fault
-# hooks and reach.c's reach_dev walker into it, build, and run it with
+# hooks, reach.c's reach_dev walker and writes.c's per-turn write sets
+# into it, build, and run it with
 # BEND_GPU_STATS=1 at each scale. Usage: ATTRIB_OUT=<dir> bash demos/app_particles_2d/attrib.sh
 # [frames=32] [scales="16384 65536 262144"; "" builds only]. BEND_GPU_WALK=0
 # skips the walks; ATTRIB_TIMEOUT bounds a run (s, default 300).
@@ -16,9 +17,9 @@ libs=()
 cd "$root"
 git rev-parse HEAD > "$out/head.txt"
 bun bend2/main.ts demos/app_particles_2d/main.bend -o "$out/particles.c" > "$out/emit.log" 2>&1
-python3 - "$out/particles.c" demos/app_particles_2d/{attrib,reach}.c <<'PY'
+python3 - "$out/particles.c" demos/app_particles_2d/{attrib,reach,writes}.c <<'PY'
 import re, sys
-path, lib = sys.argv[1], open(sys.argv[2]).read() + open(sys.argv[3]).read()
+path, lib = sys.argv[1], ''.join(open(f).read() for f in sys.argv[2:])
 part = dict(re.findall(r'^//@ (\w+)\n(.*?)(?=^//@ |\Z)', lib, re.S | re.M))
 s = open(path).read()
 def at(old, new):
@@ -28,10 +29,14 @@ def at(old, new):
     s = s.replace(old, new)
 def before(anchor, text): at(anchor, text + anchor)
 def after(anchor, text): at(anchor, anchor + text)
-before('// Cls\n// ===\n', part['tags'] + '\n')
+before('// Cls\n// ===\n', part['tags'] + part['wtags'] + '\n')
 after('    out[y * w + x] = window_pix(H, root, k, x, y);\n  }\n}\n#endif\n',
-  part['kernel'])
-before('// Cli\n// ===\n', part['host'] + part['walk'] + '\n')
+  part['kernel'] + part['wkernel'])
+before('// Cli\n// ===\n', part['wdecl'] + part['host'] + part['walk']
+  + part['whost'] + '\n')
+after('      H[got + ((u64)(i - 1) << cls)] = i < n ? got + ((u64)i << cls) : 0;\n',
+  '      AT_LINK(got + ((u64)(i - 1) << cls));\n')
+after('      e.mem[tail]     = 0;\n', '      AT_LINK(tail);\n')
 after('OUTLINE Loc heap_alloc_miss(Env e, Cls cls) {\n  Corpus H = e.mem;\n'
   '  Loc  got = 0;\n', '  AT_IN(1);\n  at_pop(e, cls, 0, false);\n')
 after('    got = bank_pop(H, cls);\n', '    at_pop(e, cls, got, true);\n')
@@ -46,7 +51,8 @@ at('    ALC_LEN(e, cls) -= 1ull << cls;\n    return h;\n  }\n'
 after('INLINE Loc heap_alloc(Env e, Cls cls) {\n  Loc h = ALC_AT(e, cls);\n',
   '  AT_IN(2);\n  AT_LC(e, cls);\n')
 at('  e.mem[loc]       = ALC_AT(e, cls);\n',
-  '  AT_IN(3);\n  e.mem[loc]       = ALC_AT(e, cls);\n  AT_OUT(3);\n')
+  '  AT_IN(3);\n  e.mem[loc]       = ALC_AT(e, cls);\n  AT_OUT(3);\n'
+  '  AT_LINK(loc);\n')
 at('FAR void term_drop(Env e, Term t) {', 'FAR void term_drop_(Env e, Term t) {')
 before('INLINE void term_sink(Env e, Term t) {', 'FAR void term_drop(Env e, '
   'Term t) {\n  AT_IN(4);\n  term_drop_(e, t);\n  AT_OUT(4);\n}\n\n')

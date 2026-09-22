@@ -2,19 +2,18 @@
 // rounds: the chunks a bang's result and argument words reach. It reads
 // the device's copy only: it moves no chunk and adds no fault.
 //@ kernel
-// A lane walks its queued word depth first like term_drop (a CTR's
-// fields, a CLO's captures, an ARR's cells) and marks the 256 KB chunks it
-// meets. It stops at leaves and tasks; strict (follow 0), also at sealed
-// cells and the bang's argument words; full (follow 1) goes through a
-// sealed cell once (seen) to what it holds. So that no dispatch runs long
-// enough to reset the driver: a bad tag or table index, or a node past
-// lim, is not read (cnt[3]; the first in cnt[6..7]); a block over
-// 2^RC_PIECE words goes back as its halves (cnt[9]); a lane steps once a
-// word popped or read, and past its budget sends the rest to the next
-// round; a dispatch runs at most RC_LANES lanes. The most a lane stepped,
-// cnt[8], is under its budget and RC_SLACK: the node that crossed it (a
-// sealed cell and what it holds) and a pop a word left on its stack. All
-// the lanes' steps: cnt[10..11], for the host's cap on a walk.
+// A lane walks its queued word depth first like term_drop and marks the
+// 256 KB chunks it meets. It stops at leaves and tasks; strict (follow 0),
+// also at sealed cells and the bang's argument words; full goes through a
+// sealed cell once (seen). So that no dispatch runs long enough to reset
+// the driver: a bad tag or table index, or a node past lim, is not read
+// (cnt[3]; the first in cnt[6..7]); a block over 2^RC_PIECE words goes
+// back as its halves (cnt[9]); a lane steps once a word popped or read,
+// and past its budget sends the rest to the next round; a dispatch runs at
+// most RC_LANES lanes. A lane's steps (the most: cnt[8]) stay under its
+// budget and RC_SLACK: the node that crossed it (a sealed cell and what it
+// holds) and a pop a word left on its stack. All steps: cnt[10..11]; with
+// ab (a bit a tracked word), the words met with their bit set: cnt[12..].
 #define RC_PIECE 8
 #define RC_STACK 48
 #define RC_LANES (1u << 15)
@@ -62,8 +61,8 @@ INLINE u64 reach_span(Term t, bool* kids) {
 }
 
 REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
-  const Term* av, u64 lo, u64 hi, u64 lim, u32 na, u32 base, u32 nin,
-  u32 cap, u32 budget, u32 follow) {
+  const Term* av, const u32* ab, u64 lo, u64 hi, u64 lim, u32 na, u32 base,
+  u32 nin, u32 cap, u32 budget, u32 follow) {
   u32 i = base + REACH_ID;
   if (i >= nin) {
     return;
@@ -72,6 +71,7 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
   u32  sp    = 0;
   u32  steps = 0;
   u64  words = 0;
+  u64  fresh = 0;
   st[sp++] = q[i];
   while (sp > 0) {
     Term t   = st[--sp];
@@ -121,6 +121,10 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
         && c <= (b1 - lo) >> 18; c += 1) {
         atomicOr(mark + (c >> 5), 1u << (c & 31));
       }
+      for (u64 w = l - lo / 8; ab && w < l - lo / 8 + n && w < (hi - lo) / 8;
+        w += 1) {
+        fresh += ab[w >> 5] >> (w & 31) & 1;
+      }
       words += n;
       steps += (u32)n;
       for (u32 j = (u32)n; kids && j-- > 0;) {
@@ -133,7 +137,7 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
         }
       }
       u64 s = l - HEAP_OFF;
-      if (!rfc || !follow || l < HEAP_OFF
+      if (!rfc || !follow
         || (atomicOr(seen + (s >> 5), 1u << (s & 31)) >> (s & 31) & 1)) {
         break;
       }
@@ -145,6 +149,7 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
   }
   atomicAdd((unsigned long long*)(cnt + 4), (unsigned long long)words);
   atomicAdd((unsigned long long*)(cnt + 10), (unsigned long long)steps);
+  atomicAdd((unsigned long long*)(cnt + 12), (unsigned long long)fresh);
   atomicMax(cnt + 8, steps);
 }
 #endif
@@ -158,31 +163,13 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
 static u64 at_bad, at_badt, at_wfail, at_step, at_split;
 static u64 at_warg[2][8][2];
 
-static u32 at_reach(u64 c) {
-  for (u32 r = 0; r < 5; r += 1) {
-    if (at_mark[r][c >> 5] >> (c & 31) & 1) {
-      return r;
-    }
-  }
-  return 5;
-}
-
-static void at_rot(u32 a, u32 b) {
-  u32* m = at_mark[b];
-  at_mark[b] = at_mark[a];
-  at_mark[a] = m;
-}
-
 // into out; w: words, chunks; t: us, rounds. A failed HIP call leaves out
 // empty and counts in at_wfail.
 static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
   u64* t) {
   static hipFunction_t pso;
-  static Term*         q;
-  static u32*          cnt;
-  static u32*          mark;
-  static u32*          seen;
-  static Term*         av;
+  static Term *        q, *av;
+  static u32 *         cnt, *mark, *seen;
   static u64           slim;
   const u32            cap = 1u << 22;
   u64 lim = HEAP_OFF + ((u64)a32_load(a32_at(CORPUS, H_CAP)) << PAGE_BITS);
@@ -217,10 +204,10 @@ static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
     for (u32 b = 0; ok && b < nin && all + (got[10] | (u64)got[11] << 32)
       <= RC_ALL; b += RC_LANES) {
       struct { Corpus H; Term* q; u32* cnt; u32* mark; u32* seen; Term* av;
-        u64 lo; u64 hi; u64 lim; u32 na; u32 base; u32 nin; u32 cap;
+        u32* ab; u64 lo; u64 hi; u64 lim; u32 na; u32 base; u32 nin; u32 cap;
         u32 budget; u32 follow; } args = { gpu_vram, q, cnt, mark, seen, av,
-        gpu_lo, gpu_hi, lim, at_argn, b, nin, cap, reach_budget(nin),
-        follow };
+        follow ? at_ab : NULL, gpu_lo, gpu_hi, lim, at_argn, b, nin, cap,
+        reach_budget(nin), follow };
       u32    lanes = nin - b < RC_LANES ? nin - b : RC_LANES;
       size_t len   = sizeof args;
       void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
@@ -237,6 +224,7 @@ static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
     at_hits  += got[2];
     all      += got[10] | (u64)got[11] << 32;
     wds      += got[4] | (u64)got[5] << 32;
+    at_rA    += got[12] | (u64)got[13] << 32;
     at_bad   += got[3];
     at_split += got[9];
     at_step   = got[8] > at_step ? got[8] : at_step;
@@ -294,17 +282,16 @@ static void at_reach_walk(Corpus H) {
 }
 
 static void at_walk_print(double f) {
-  static const char* what[11] = { "result", "result through sealed cells",
-    "argument words as it began", "0", "1", "2", "3", "4", "5", "6", "7" };
+  static const char* what[4] = { "result", "result through sealed cells",
+    "argument words as it began", "argument word " };
   for (u32 p = 0; p < 2; p += 1) {
     for (u32 x = 0; x < 11; x += 1) {
       u64* w = x < 3 ? at_walk[p] + 2 * x : at_warg[p][x - 3];
-      if (x >= 3 && w[0] == 0) {
-        continue;
+      if (x < 3 || w[0] != 0) {
+        fprintf(stderr, "attrib: %s bang's %s%.1s reach %.0f words in %.1f"
+          " chunks\n", p ? "raster" : "sim", what[x < 3 ? x : 3],
+          x < 3 ? "" : &"01234567"[x - 3], w[0] / f, w[1] / f);
       }
-      fprintf(stderr, "attrib: %s bang's %s%s reach %.0f words in %.1f"
-        " chunks\n", p ? "raster" : "sim", x < 3 ? "" : "argument word ",
-        what[x], w[0] / f, w[1] / f);
     }
     fprintf(stderr, "attrib: %s walks %.0f us, %.1f rounds\n",
       p ? "raster" : "sim", at_walk[p][6] / f, at_walk[p][7] / f);
