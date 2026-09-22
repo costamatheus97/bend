@@ -4888,16 +4888,16 @@ static void* pool_mmap(u64 bytes) {
 #if BEND_HIP
 // gpu_fault calls into HIP, so the signal stack is a real one
 #define TRAP_STK (1u << 20)
-static bool gpu_fault(void* addr, bool wr);
+static bool gpu_fault(void* addr, u32 wr);
 
-// x86-64 says whether the access was a write (the page fault's error code);
-// elsewhere a fault on a clean chunk is taken for one
+// wr: 0 a read, 1 a write, as x86-64 tells (the page fault's error code);
+// elsewhere 2, either: a write on a clean chunk, a read on a stale one
 static void gpu_trap(int sig, siginfo_t* si, void* uc) {
 #ifdef __x86_64__
-  bool wr = sig != SIGSEGV
+  u32 wr = sig != SIGSEGV
     || (((ucontext_t*)uc)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
 #else
-  bool wr = true;
+  u32 wr = 2;
 #endif
   if (!gpu_fault(si->si_addr, wr)) {
     err_trap(sig);
@@ -5332,7 +5332,10 @@ static bool gpu_probe(void) {
 // under it. A fault fills a chunk through gpu_alias, a second mapping,
 // while the chunk still traps, so no other host thread sees it half
 // filled. A chunk no turn has left behind yet is dirty, as it always was.
+// An upload may span GPU_GAP clean chunks between dirty ones: 0, as the
+// particles at 262,144 lost more to the bytes than they saved in calls.
 #define GPU_CHUNK (1ull << 18)
+#define GPU_GAP   0
 #define GPU_DIRTY 0
 #define GPU_STALE 1
 #define GPU_CLEAN 2
@@ -5345,7 +5348,7 @@ static u32   gpu_fault_lock;
 static bool gpu_stat;
 static u32  gpu_part;  // 0 header, 1 rings, 2 heap, 3 banks
 static u64  gpu_turns, gpu_faults, gpu_dev_ns;
-static u64  gpu_writes, gpu_served, gpu_sent;  // clean to dirty; chunks up
+static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
 static u64  gpu_calls[4][2], gpu_bytes[4][2], gpu_ns[4][2];
 static u64  io_tick(void);
 
@@ -5358,10 +5361,11 @@ static void gpu_tally(u32 k, bool up, u64 bytes, u64 t0) {
 static void gpu_stats(void) {
   static const char* part[4] = { "header", "rings ", "heap  ", "banks " };
   fprintf(stderr, "bend: hip %llu turns, passes %llu us, %llu chunk faults"
-    ", %llu clean to dirty, %llu served already, %llu chunks up (%llu a turn)"
-    "\n", (unsigned long long)gpu_turns,
+    " (%llu writes), %llu clean to dirty, %llu served already, %llu chunks up"
+    " (%llu a turn)\n", (unsigned long long)gpu_turns,
     (unsigned long long)(gpu_dev_ns / 1000), (unsigned long long)gpu_faults,
-    (unsigned long long)gpu_writes, (unsigned long long)gpu_served,
+    (unsigned long long)gpu_wrote, (unsigned long long)gpu_writes,
+    (unsigned long long)gpu_served,
     (unsigned long long)gpu_sent,
     (unsigned long long)(gpu_sent / (gpu_turns ? gpu_turns : 1)));
   for (u32 k = 0; k < 4; k += 1) {
@@ -5533,14 +5537,20 @@ static void gpu_heap(u64 end, bool up) {
     gpu_copy(gpu_hi / 8, end, up);
   }
   u64 n = (te - gpu_lo) / GPU_CHUNK;
-  for (u64 c = 0; up && c < n; c += 1) {
-    u64 lo = c;
-    while (c < n && gpu_state[c] == GPU_DIRTY) {
+  for (u64 c = 0; up && c < n;) {
+    while (c < n && gpu_state[c] != GPU_DIRTY) {
       c += 1;
     }
-    gpu_sent += c - lo;
-    gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + c * GPU_CHUNK) / 8, up);
+    u64 lo = c;
+    u64 hi = c;
+    for (; c < n && c <= hi + GPU_GAP && gpu_state[c] != GPU_STALE; c += 1) {
+      hi = gpu_state[c] == GPU_DIRTY ? c + 1 : hi;
+    }
+    gpu_sent += hi - lo;
+    gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + hi * GPU_CHUNK) / 8, up);
+    c = hi;
   }
+  // Plain stores: no host thread runs during a turn (see gpu_fault)
   if (!up && n != 0) {
     LOCK(gpu_fault_lock);
     if (mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
@@ -5551,12 +5561,16 @@ static void gpu_heap(u64 end, bool up) {
   }
 }
 
-// Stale: download under the lock, read only, clean; a write faults again.
-// Clean and a write: read-write, then dirty, with no lock: no bytes move,
-// two writers make the same change, and a download of another chunk would
-// hold them for its copy. Anything else trapped while the chunk was stale
-// and another thread served it.
-static bool gpu_fault(void* addr, bool wr) {
+// Stale: download under the lock; a write: read-write, dirty; else read
+// only, clean. Clean and a write: read-write, then dirty, with no lock: no
+// bytes move, two writers make the same change, and a download of another
+// chunk would hold them for its copy. Anything else trapped while the
+// chunk was stale and another thread served it. Unlocked, as the leave's
+// stores are, this needs what holds today: no host thread touches the
+// corpus in gpu_enter, gpu_leave or gpu_show, and the uploader sees the
+// flags and bytes through the pool's barrier (pool_done, released in
+// pool_work, acquired in pool_turn). An async turn must restore that.
+static bool gpu_fault(void* addr, u32 wr) {
   u64 off = (u64)((char*)addr - (char*)CORPUS);
   if (gpu_state == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
     || off >= gpu_hi) {
@@ -5569,8 +5583,8 @@ static bool gpu_fault(void* addr, bool wr) {
   bool ok = true;
   if (s == GPU_CLEAN && wr) {
     ok = mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ | PROT_WRITE) == 0;
-    if (ok) {
-      __atomic_store_n(st, GPU_DIRTY, __ATOMIC_RELEASE);
+    if (ok && __atomic_exchange_n(st, GPU_DIRTY, __ATOMIC_RELEASE)
+      == GPU_CLEAN) {
       __atomic_fetch_add(&gpu_writes, 1, __ATOMIC_RELAXED);
     }
     return ok;
@@ -5580,12 +5594,15 @@ static bool gpu_fault(void* addr, bool wr) {
     s = __atomic_load_n(st, __ATOMIC_RELAXED);
     if (s == GPU_STALE) {
       u64 t0 = gpu_stat ? io_tick() : 0;
+      u8  to = wr == 1 ? GPU_DIRTY : GPU_CLEAN;
       ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
         hipMemcpyDeviceToHost) == hipSuccess
-        && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ) == 0;
-      __atomic_store_n(st, ok ? GPU_CLEAN : GPU_STALE, __ATOMIC_RELEASE);
+        && mprotect((char*)CORPUS + at, GPU_CHUNK,
+          wr == 1 ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
+      __atomic_store_n(st, ok ? to : GPU_STALE, __ATOMIC_RELEASE);
       if (gpu_stat) {
         gpu_faults += 1;
+        gpu_wrote  += wr == 1;
         gpu_tally(2, false, GPU_CHUNK, t0);
       }
     }
@@ -5665,10 +5682,12 @@ static void gpu_show(Term image, u32 w, u32 h, u32 k, u32* pix) {
     }
     cap = len;
   }
+  u64 sent = gpu_sent;  // a frame's chunks are not a turn's
   gpu_part = 2;
   gpu_heap(HEAP_OFF
     + (((u64)a32_load(a32_at(CORPUS, H_BUMP)) + 1) << PAGE_BITS), true);
   gpu_part = 0;
+  gpu_sent = sent;
   args.mem  = gpu_vram;
   args.root = image;
   args.w    = w;
