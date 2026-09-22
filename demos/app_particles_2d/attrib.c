@@ -20,14 +20,15 @@ static __thread u64 at_lc;
   at_new[at_newk++ & 7][1] = 1ull << (c))
 static void at_pop(Env e, Cls cls, Loc got, bool bank);
 static void at_pre(u64 c);
-static void at_fault(u64 c, void* addr, u32 how);
+static bool at_fault(u64 c, void* addr, u32 how);
 static void at_enter(void);
 static void at_leave(void);
 static void at_reach_walk(Corpus H);
 static void at_arg_walk(void);
 static void at_walk_print(double f);
 static u32  at_reach(u64 c);
-static Term at_arg[4];
+static Term at_arg[8];
+static u32  at_argn;
 #else
 #define AT_IN(k)           ((void)0)
 #define AT_OUT(k)          ((void)0)
@@ -52,7 +53,7 @@ static u64   at_nch, at_mw, at_bump, at_bangs, at_frames;
 static char* at_buf;         // the host's pre-image, then the device's
 static char* at_dev;         // the device's heap as the turn began
 static u64   at_devn;        // its chunks
-static bool  at_cmp;
+static bool  at_cmp, at_dcmp;
 static u64   at_n[2][K_N][3][6];  // [after sim, raster][kind][how][reach]
 static u64   at_mat[K_N][K_N];    // downloaded by, first written by
 static u64   at_cur_n[3];         // downloads by at_cur
@@ -63,18 +64,18 @@ static u64   at_pops[4];          // bank pops: all, the device's, past the bump
 static u64   at_walk[2][8];
 static u64   at_hits, at_over;
 static u64*  at_set;              // heads the device handed, open addressing
-static u64   at_setc;
+static u64   at_setc;             // (a power of two)
 static u32   at_lock;
 static u64*  at_snap[NCLS_ALL];
 static u32   at_snapn[NCLS_ALL];
 #define AT_ADD(p, v) __atomic_fetch_add(&(p), v, __ATOMIC_RELAXED)
 
-static u64* at_slot(u64 v) {
-  u64 i = (v * 0x9E3779B97F4A7C15ull) & (at_setc - 1);
-  while (at_set[i] != 0 && at_set[i] != v) {
-    i = (i + 1) & (at_setc - 1);
+static u64* at_slot(u64* set, u64 n, u64 v) {
+  u64 i = (v * 0x9E3779B97F4A7C15ull) & (n - 1);
+  while (set[i] != 0 && set[i] != v) {
+    i = (i + 1) & (n - 1);
   }
-  return &at_set[i];
+  return &set[i];
 }
 
 static void at_pop(Env e, Cls cls, Loc got, bool bank) {
@@ -87,7 +88,7 @@ static void at_pop(Env e, Cls cls, Loc got, bool bank) {
     return;
   }
   LOCK(at_lock);
-  u64* s   = at_setc ? at_slot(got) : NULL;
+  u64* s   = at_setc ? at_slot(at_set, at_setc, got) : NULL;
   bool dev = s != NULL && *s == got;
   if (dev) {
     *s = 1;  // a tombstone: never a heap Loc
@@ -132,10 +133,8 @@ static void at_pre(u64 c) {
   if (at_cmp) {
     memcpy(at_buf, gpu_alias + gpu_lo + c * GPU_CHUNK, GPU_CHUNK);
   }
-  if (c < at_devn) {
-    hipMemcpy(at_buf + GPU_CHUNK, at_dev + c * GPU_CHUNK, GPU_CHUNK,
-      hipMemcpyDeviceToHost);
-  }
+  at_dcmp = c < at_devn && hipMemcpy(at_buf + GPU_CHUNK, at_dev + c
+    * GPU_CHUNK, GPU_CHUNK, hipMemcpyDeviceToHost) == hipSuccess;
 }
 
 static void at_diff_add(u64* d, const u8* a, const u8* b) {
@@ -150,11 +149,13 @@ static void at_diff_add(u64* d, const u8* a, const u8* b) {
   }
 }
 
-// how: 0 a download by a read, 1 by a write (under the lock), 2 the first
-// write to a clean chunk (no lock)
-static void at_fault(u64 c, void* addr, u32 how) {
+// how: 0 a download by a read, 1 by a write, 2 the first write to a
+// clean chunk. A download's runs under the lock, after the copy into the
+// alias and before the chunk opens, so the bytes it compares are the
+// device's alone and its tags are set before another thread can fault.
+static bool at_fault(u64 c, void* addr, u32 how) {
   if (at_cur == NULL || c >= at_nch) {
-    return;
+    return true;
   }
   u32 k  = at_kind((u64)((char*)addr - (char*)CORPUS) / 8);
   u32 r  = at_reach(c);
@@ -167,7 +168,7 @@ static void at_fault(u64 c, void* addr, u32 how) {
     AT_ADD(at_mat[at_dtag[c] - 1][k], 1);
   }
   if (how == 2) {
-    return;
+    return true;
   }
   const u8* now = (const u8*)gpu_alias + gpu_lo + c * GPU_CHUNK;
   at_cur_n[at_cur[c]] += 1;
@@ -175,9 +176,10 @@ static void at_fault(u64 c, void* addr, u32 how) {
     at_diff_add(at_diff[0][at_cur[c]], (const u8*)at_buf, now);
     at_diff_add(at_diff[2][r], (const u8*)at_buf, now);
   }
-  if (c < at_devn) {
+  if (at_dcmp) {
     at_diff_add(at_diff[1][r], (const u8*)at_buf + GPU_CHUNK, now);
   }
+  return true;
 }
 
 static void at_print(void) {
@@ -269,7 +271,8 @@ static void at_enter(void) {
 }
 
 // After a turn, before root_take: the banks' heads the device pushed (past
-// the longest prefix still as the enter left it), then the result's reach
+// the longest prefix still as the enter left it), and those an earlier
+// turn pushed that are still in that prefix, then the result's reach
 static void at_leave(void) {
   Corpus H = CORPUS;
   if (!gpu_stat || at_cur == NULL || a32_load(a32_at(H, H_ROOT_DONE)) == 0) {
@@ -281,20 +284,25 @@ static void at_leave(void) {
   for (Cls c = 0; c < NCLS_ALL; c += 1) {
     all += bank_at(H, c)->rd;
   }
+  u64* old = at_set;
+  u64  oc  = at_setc;
   for (at_setc = 16; at_setc < 2 * all; at_setc *= 2) {
   }
-  at_set = realloc(at_set, at_setc * 8);
-  memset(at_set, 0, at_setc * 8);
+  at_set = calloc(at_setc, 8);
   for (Cls c = 0; c < NCLS_ALL; c += 1) {
     Bank* b = bank_at(H, c);
     u32   i = 0;
     while (i < b->rd && i < at_snapn[c] && H[b->off + i] == at_snap[c][i]) {
       i += 1;
     }
-    for (; i < b->rd; i += 1) {
-      *at_slot(H[b->off + i]) = H[b->off + i];
+    for (u32 j = 0; j < b->rd; j += 1) {
+      u64 v = H[b->off + j];
+      if (j >= i || (oc && *at_slot(old, oc, v) == v)) {
+        *at_slot(at_set, at_setc, v) = v;
+      }
     }
   }
+  free(old);
   at_reach_walk(H);
 }
 #endif

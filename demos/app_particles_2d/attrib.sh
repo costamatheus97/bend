@@ -3,8 +3,8 @@
 # runtime): emit the probe's C, splice attrib.c's phase tags and fault
 # hooks and reach.c's reach_dev walker into it, build, and run it with
 # BEND_GPU_STATS=1 at each scale. Usage: ATTRIB_OUT=<dir> bash demos/app_particles_2d/attrib.sh
-# [frames=32] [scales="16384 65536 262144"]. BEND_GPU_WALK=0 skips the walks,
-# ATTRIB_TRACE=1 prints each walk round, ATTRIB_TIMEOUT bounds a run (s).
+# [frames=32] [scales="16384 65536 262144"; "" builds only]. BEND_GPU_WALK=0
+# skips the walks; ATTRIB_TIMEOUT bounds a run (s, default 300).
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out=${ATTRIB_OUT:?set ATTRIB_OUT}
@@ -63,13 +63,18 @@ after('      __atomic_fetch_add(&gpu_writes, 1, __ATOMIC_RELAXED);\n',
   '      if (gpu_stat) {\n        at_fault(c, addr, 2);\n      }\n')
 after('      u8  to = wr == 1 ? GPU_DIRTY : GPU_CLEAN;\n',
   '      if (gpu_stat) {\n        at_pre(c);\n      }\n')
-after('        gpu_wrote  += wr == 1;\n', '        at_fault(c, addr, wr == 1);\n')
+at('        hipMemcpyDeviceToHost) == hipSuccess\n        && mprotect(',
+  '        hipMemcpyDeviceToHost) == hipSuccess\n'
+  '        && (!gpu_stat || at_fault(c, addr, wr == 1))\n        && mprotect(')
 at('  gpu_part = 0;\n}\n\n#define gpu_enter() gpu_sync(true)',
   '  gpu_part = 0;\n  if (gpu_stat && up) {\n    at_enter();\n  }\n}\n\n'
   '#define gpu_enter() gpu_sync(true)')
 at('        gpu_enter();\n        cube_run(H, true);\n        gpu_leave();\n',
-  '        for (u32 j = 0; j < 4; j += 1) {\n          at_arg[j] = j < fid_arity('
-  '(u32)term_aux(t)) ? H[term_loc(t) + j] : 0;\n        }\n        gpu_enter();\n'
+  '        at_argn = fid_arity((u32)term_aux(t));\n'
+  '        at_argn = at_argn < 8 ? at_argn : 8;\n'
+  '        for (u32 j = 0; j < 8; j += 1) {\n'
+  '          at_arg[j] = j < at_argn ? H[term_loc(t) + j] : 0;\n'
+  '        }\n        gpu_enter();\n'
   '        cube_run(H, true);\n        gpu_leave();\n        at_leave();\n')
 open(path, 'w').write(s)
 PY
@@ -79,10 +84,10 @@ fi
 "$CC" -DBEND_HIP=1 -D__HIP_PLATFORM_AMD__ -I"$rocm/include" -L"$rocm/lib" \
   -Wl,-rpath,"$rocm/lib" -std=c11 -O3 "$out/particles.c" -lpthread -lm \
   "${libs[@]}" -o "$out/particles" -lamdhip64 -lhiprtc > "$out/build.log" 2>&1
-"$out/particles" --gpu-build >> "$out/build.log" 2>&1
-for scale in ${2:-16384 65536 262144}; do
+timeout 300 "$out/particles" --gpu-build >> "$out/build.log" 2>&1
+for scale in ${2-16384 65536 262144}; do
   BEND_GPU_STATS=1 PARTICLES_PROBE=${1:-32} PARTICLES_SCALE=$scale \
-    timeout "${ATTRIB_TIMEOUT:-1200}" "$out/particles" --threads 16 --gpu 3GB \
+    timeout "${ATTRIB_TIMEOUT:-300}" "$out/particles" --threads 16 --gpu 3GB \
     > "$out/$scale.out" 2> "$out/$scale.err"
   echo "== $scale: $(grep -o 'median_us.*' "$out/$scale.out")"
   grep -h 'checksum\|hip [0-9]* turns\|heap  \|^attrib' "$out/$scale.out" "$out/$scale.err"
