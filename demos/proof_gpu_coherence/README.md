@@ -1,15 +1,15 @@
 # GPU chunk coherence, proven
 
-A model of the HIP lane's lazy chunk protocol in `bend2/comp.ts` as of
-32c8d44e (`gpu_fault`, `gpu_heap`'s enter and leave, `gpu_fetch`,
-`gpu_touch`, `gpu_publish`), with its safety laws proven in Bend.
+The HIP lane's lazy chunk protocol in `bend2/comp.ts` at 32c8d44e
+(`gpu_fault`, `gpu_heap`'s enter and leave, `gpu_fetch`, `gpu_touch`,
+`gpu_publish`), modelled, with its safety laws proven in Bend.
 
 - `main.bend`: the model. Per chunk: state, host protection, host and
   device bytes, and a ghost holding the last write. Events at the C's
   atomicity: host read and write, each later step of a fault, enter,
-  device store, leave with its prefetch, bump of n.
+  device store, leave and its prefetch, bump.
 - `LAWS.bend`: the laws, for any event list the hypotheses allow.
-- `Chunk.bend`, `PROOF.bend`: the invariant, kept by every event.
+- `Chunk.bend`, `PROOF.bend`: the invariant and its proof.
 
 `bun bend2/main.ts demos/proof_gpu_coherence/PROOF.bend --check-only`
 
@@ -21,16 +21,15 @@ A model of the HIP lane's lazy chunk protocol in `bend2/comp.ts` as of
   readable; in a turn, every chunk under n holds its last write in VRAM.
 - L3: between turns, a FETCHED chunk with no section open traps, and
   its host bytes equal VRAM and the last write.
-- L4: per chunk, FETCHED (0 or 1) plus used equals whether the leave
-  fetched it.
+- L4: per chunk, FETCHED (0 or 1) plus used = the leave fetched it.
 
-No liveness: a fault handler that never opens a chunk keeps them all.
+No liveness: a fault that never opens its chunk keeps them all.
 
 ## Hypotheses (`Ok` in main.bend)
 
 - Host accesses and fault steps run between turns; an enter finds no
-  thread in `gpu_fault` (5566-5572).
-- The device stores only under n.
+  thread in `gpu_fault` (comp.ts 5686-5690).
+- Device stores land under n.
 - n only grows: `heap_alloc` adds to H_BUMP before its capacity check
   and ERR_HEAP keeps the add, n clamps at gpu_hi, and the u32 is
   assumed never to wrap. A shrunken n breaks L1 and L2.
@@ -44,18 +43,22 @@ No liveness: a fault handler that never opens a chunk keeps them all.
 Chunk runs and the GAP merge; the memfd layout; timing counters; the
 device running beside the host (turns are exclusive); weak memory (the
 model is sequentially consistent); the global fault lock (a per-chunk
-lock over-approximates it); a trap and its first state load are one
-step, so a load that finds the chunk opened by another thread is
-served, argued rather than modelled; `wr == 2`; mprotect and hipMemcpy
-failures; `gpu_show`'s upload. The laws hold for any prefetch set.
+lock over-approximates it); a trap and its first state load as two
+steps (merged: the diff test runs the C's late loads); `wr == 2`;
+mprotect and hipMemcpy failures; `gpu_show`'s upload. The laws hold for
+any prefetch set.
 
 ## Tested against the C
 
-`logs/cohmodel` (outside the repo) runs the C's functions, extracted
-from 32c8d44e, one pthread per access, against the model: heap ends
-inside, below and above [gpu_lo, gpu_hi], bumps in turns (VRAM header
-only), late state loads that are served. It compares the first, middle
-and last word of each chunk, not every word.
+`logs/cohmodel` (outside the repo) runs the C's functions from
+32c8d44e, one pthread per access, against the model: heap ends inside,
+below and above [gpu_lo, gpu_hi], bumps in turns (VRAM header only),
+served late loads. It compares the first, middle and last word of each
+tracked chunk. Not compared: the header (only through n), [STAT_OFF,
+gpu_lo), [gpu_hi, end), rings and banks (stubbed); dropping either
+copy outside [gpu_lo, gpu_hi) goes unseen. Untested: a late load that
+finds its chunk mid-section (argued harmless: it changes nothing
+shared), and gpu_hi's round-down (gpu_hi sits on 4 MB).
 
 ## Stage 2 preview
 

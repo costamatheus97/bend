@@ -907,7 +907,7 @@ def BOk(ph: Ph, ins: List<&2, Ch>, m: Nat, outs: List<&2, Ch>) -> Type:
 
 # what each event needs: host accesses and fault steps between turns
 # (no host thread runs in a turn, the enter or the leave); an enter
-# with no thread in gpu_fault (the contract at comp.ts 5566-5572; above
+# with no thread in gpu_fault (the contract at comp.ts 5686-5690; above
 # n none can be, those chunks never trap); a device store under n, in
 # a turn; n monotone.
 # Storage: every chunk starts with 0 on both sides, the value no one
