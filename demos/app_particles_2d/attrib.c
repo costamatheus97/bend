@@ -26,6 +26,7 @@ static void at_leave(void);
 static void at_reach_walk(Corpus H);
 static void at_arg_walk(void);
 static void at_walk_print(double f);
+static void at_print(void);
 static u32  at_reach(u64 c);
 static Term at_arg[8];
 static u32  at_argn;
@@ -49,7 +50,7 @@ static u8*   at_cur;       // at the enter: 0 stale, 1 current, 2 past the bump
 static u8*   at_dtag;      // 1 + the kind that downloaded the chunk
 static u32*  at_mark[5];   // reach (reach.c)
 static u8    at_chain[CUBE_T + 1][NCLS_ALL];
-static u64   at_nch, at_mw, at_bump, at_bangs, at_frames;
+static u64   at_nch, at_mw, at_bump, at_bangs, at_frames, at_warm;
 static char* at_buf;         // the host's pre-image, then the device's
 static char* at_dev;         // the device's heap as the turn began
 static u64   at_devn;        // its chunks
@@ -183,56 +184,6 @@ static bool at_fault(u64 c, void* addr, u32 how) {
   return true;
 }
 
-static void at_print(void) {
-  double f = at_frames ? (double)at_frames : 1;
-  static const char* how[3] = { "down by read", "down by write",
-    "first write" };
-  fprintf(stderr, "attrib: %llu frames; per frame; reach: the last result,"
-    " through sealed cells, the one before; the last bang's arguments, the"
-    " one before's; none\n",
-    (unsigned long long)at_frames);
-  for (u32 ph = 0; ph < 2; ph += 1) {
-    for (u32 k = 0; k < K_N; k += 1) {
-      for (u32 h = 0; h < 3; h += 1) {
-        u64* n = at_n[ph][k][h];
-        if (n[0] + n[1] + n[2] + n[3] + n[4] + n[5] != 0) {
-          fprintf(stderr, "attrib: after %s  %-7s %-13s %6.1f %6.1f %6.1f"
-            " %6.1f %6.1f %6.1f\n", ph ? "raster" : "sim   ", at_name[k],
-            how[h], n[0] / f, n[1] / f, n[2] / f, n[3] / f, n[4] / f,
-            n[5] / f);
-        }
-      }
-    }
-  }
-  for (u32 a = 0; a < K_N; a += 1) {
-    for (u32 b = 0; b < K_N; b += 1) {
-      if (at_mat[a][b] != 0) {
-        fprintf(stderr, "attrib: downloaded by %-7s first written by %-7s"
-          " %8.1f\n", at_name[a], at_name[b], at_mat[a][b] / f);
-      }
-    }
-  }
-  fprintf(stderr, "attrib: downloads %.1f: stale at the enter %.1f, current"
-    " %.1f, past its bump %.1f\n", (at_cur_n[0] + at_cur_n[1] + at_cur_n[2])
-    / f, at_cur_n[0] / f, at_cur_n[1] / f, at_cur_n[2] / f);
-  for (u32 x = 0; x < 3; x += 1) {
-    for (u32 r = 0; r < 6; r += 1) {
-      u64* d = at_diff[x][r];
-      if (d[0] != 0) {
-        fprintf(stderr, "attrib: vs the %s %u: %.1f chunks, %.1f%% of"
-          " lines, %.2f%% of bytes changed\n", x == 1
-          ? "device's pre-turn, reach" : x ? "host's last copy, reach"
-          : "host's last copy, at_cur", r, d[0] / f,
-          100.0 * d[1] / (d[0] * 2048.0),
-          100.0 * d[2] / (d[0] * (double)GPU_CHUNK));
-      }
-    }
-  }
-  fprintf(stderr, "attrib: bank pops %.1f, from the device %.1f, past the"
-    " enter's bump %.1f\n", at_pops[0] / f, at_pops[1] / f, at_pops[2] / f);
-  at_walk_print(f);
-}
-
 static void at_enter(void) {
   Corpus H = CORPUS;
   if (at_cur == NULL) {
@@ -248,6 +199,8 @@ static void at_enter(void) {
       err_fail("attrib: no room for the heap's snapshot");
     }
     atexit(at_print);
+    const char* w = getenv("ATTRIB_WARM");  // frames; main.bend's 8
+    at_warm = 2 * (w ? strtoull(w, NULL, 10) : 8);
   }
   u64 bump = a32_load(a32_at(H, H_BUMP));
   u64 e    = (HEAP_OFF + ((bump + 1) << PAGE_BITS)) * 8;
@@ -257,6 +210,10 @@ static void at_enter(void) {
   for (u64 c = 0; c < at_nch; c += 1) {
     at_cur[c]  = c >= n ? 2 : gpu_state[c] != GPU_STALE;
     at_dtag[c] = 0;
+  }
+  wr_drain(true);
+  if (at_bangs == at_warm) {
+    wr_zero();
   }
   at_bump = HEAP_OFF + (bump << PAGE_BITS);
   // a failed snapshot compares nothing against it and ends the write
@@ -283,7 +240,7 @@ static void at_leave(void) {
     return;
   }
   at_bangs += 1;
-  at_frames = at_bangs / 2;
+  at_frames = at_bangs > at_warm ? (at_bangs - at_warm) / 2 : 0;
   u64 all = 0;
   for (Cls c = 0; c < NCLS_ALL; c += 1) {
     all += bank_at(H, c)->rd;

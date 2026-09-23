@@ -12,7 +12,8 @@
 // most RC_LANES lanes. A lane's steps (the most: cnt[8]) stay under its
 // budget and RC_SLACK: the node that crossed it (a sealed cell and what it
 // holds) and a pop a word left on its stack. All steps: cnt[10..11]; with
-// ab (a bit a tracked word), the words met with their bit set: cnt[12..].
+// ab (a bit a tracked word), the words met with their bit set: cnt[12..],
+// those met first (a bit in met) cnt[14..], their chunks into amark.
 #define RC_PIECE 8
 #define RC_STACK 48
 #define RC_LANES (1u << 15)
@@ -61,8 +62,8 @@ INLINE u64 reach_span(Term t, bool* kids) {
 }
 
 REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
-  const Term* av, const u32* ab, u64 lo, u64 hi, u64 lim, u32 na, u32 base,
-  u32 nin, u32 cap, u32 budget, u32 follow) {
+  const Term* av, const u32* ab, u32* met, u32* amark, u64 lo, u64 hi,
+  u64 lim, u32 na, u32 base, u32 nin, u32 cap, u32 budget, u32 follow) {
   u32 i = base + REACH_ID;
   if (i >= nin) {
     return;
@@ -72,6 +73,7 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
   u32  steps = 0;
   u64  words = 0;
   u64  fresh = 0;
+  u64  first = 0;
   st[sp++] = q[i];
   while (sp > 0) {
     Term t   = st[--sp];
@@ -123,7 +125,14 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
       }
       for (u64 w = l - lo / 8; ab && w < l - lo / 8 + n && w < (hi - lo) / 8;
         w += 1) {
-        fresh += ab[w >> 5] >> (w & 31) & 1;
+        u32 m = 1u << (w & 31);
+        if (ab[w >> 5] & m) {
+          fresh += 1;
+          if (!(atomicOr(met + (w >> 5), m) & m)) {
+            first += 1;
+            atomicOr(amark + (w >> 20), 1u << (w >> 15 & 31));
+          }
+        }
       }
       words += n;
       steps += (u32)n;
@@ -150,6 +159,7 @@ REACH_DEV reach_dev(Corpus H, Term* q, u32* cnt, u32* mark, u32* seen,
   atomicAdd((unsigned long long*)(cnt + 4), (unsigned long long)words);
   atomicAdd((unsigned long long*)(cnt + 10), (unsigned long long)steps);
   atomicAdd((unsigned long long*)(cnt + 12), (unsigned long long)fresh);
+  atomicAdd((unsigned long long*)(cnt + 14), (unsigned long long)first);
   atomicMax(cnt + 8, steps);
 }
 #endif
@@ -215,11 +225,13 @@ static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
         cut = true;
         break;
       }
+      bool ab = follow && at_ab;  // with at_met and at_amark
       struct { Corpus H; Term* q; u32* cnt; u32* mark; u32* seen; Term* av;
-        u32* ab; u64 lo; u64 hi; u64 lim; u32 na; u32 base; u32 nin; u32 cap;
-        u32 budget; u32 follow; } args = { gpu_vram, q, cnt, mark, seen, av,
-        follow ? at_ab : NULL, gpu_lo, gpu_hi, lim, at_argn, b, nin, cap,
-        budget, follow };
+        u32* ab; u32* met; u32* amark; u64 lo; u64 hi; u64 lim; u32 na;
+        u32 base; u32 nin; u32 cap; u32 budget; u32 follow; } args = {
+        gpu_vram, q, cnt, mark, seen, av, ab ? at_ab : NULL, ab ? at_met
+        : NULL, ab ? at_amark : NULL, gpu_lo, gpu_hi, lim, at_argn, b, nin,
+        cap, budget, follow };
       size_t len   = sizeof args;
       void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
         HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
@@ -236,6 +248,7 @@ static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
     all      += got[10] | (u64)got[11] << 32;
     wds      += got[4] | (u64)got[5] << 32;
     at_rA    += got[12] | (u64)got[13] << 32;
+    at_rAd   += got[14] | (u64)got[15] << 32;
     at_bad   += got[3];
     at_split += got[9];
     at_step   = got[8] > at_step ? got[8] : at_step;
@@ -284,11 +297,13 @@ static void at_arg_walk(void) {
 // after the leave, before root_take: the result's
 static void at_reach_walk(Corpus H) {
   u32  n = a32_load(a32_at(H, H_ROOT_DONE)) - 1;
-  u64* w = at_walk[(at_bangs + 1) & 1];
+  u32  p = (at_bangs + 1) & 1;
+  u64* w = at_walk[p];
   at_rot(1, 2);
-  if (at_walks()) {
-    at_walk1(H + H_ROOT_WORD, n, 0, at_mark[0], w, w + 6);
-    at_walk1(H + H_ROOT_WORD, n, 1, at_mark[1], w + 2, w + 6);
+  for (u32 f = 0; at_walks() && f < 2; f += 1) {
+    u64 t0 = w[6];
+    at_walk1(H + H_ROOT_WORD, n, f, at_mark[f], w + 2 * f, w + 6);
+    at_tw[p][f] += w[6] - t0;
   }
 }
 #endif

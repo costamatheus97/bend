@@ -1,8 +1,8 @@
 #!/bin/bash
 # Stage 1 fault attribution on the HIP lane (a measurement build, not the
 # runtime): emit the probe's C, splice attrib.c's phase tags and fault
-# hooks, reach.c's reach_dev walker, writes.c's per-turn write sets and
-# tally.c's prints into it, build, and run it with
+# hooks, reach.c's reach_dev walker, record.c's and writes.c's per-turn
+# write sets and tally.c's prints into it, build, and run it with
 # BEND_GPU_STATS=1 at each scale. Usage: ATTRIB_OUT=<dir> bash demos/app_particles_2d/attrib.sh
 # [frames=32] [scales="16384 65536 262144"; "" builds only]. BEND_GPU_WALK=0
 # skips the walks; ATTRIB_TIMEOUT bounds a run (s, default 300).
@@ -17,7 +17,7 @@ libs=()
 cd "$root"
 git rev-parse HEAD > "$out/head.txt"
 bun bend2/main.ts demos/app_particles_2d/main.bend -o "$out/particles.c" > "$out/emit.log" 2>&1
-python3 - "$out/particles.c" demos/app_particles_2d/{attrib,reach,writes,tally}.c <<'PY'
+python3 - "$out/particles.c" demos/app_particles_2d/{attrib,reach,record,writes,tally}.c <<'PY'
 import re, sys
 path, lib = sys.argv[1], ''.join(open(f).read() for f in sys.argv[2:])
 part = dict(re.findall(r'^//@ (\w+)\n(.*?)(?=^//@ |\Z)', lib, re.S | re.M))
