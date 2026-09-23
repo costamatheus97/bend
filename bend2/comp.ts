@@ -5052,7 +5052,7 @@ static void gpu_note(const char* path) {
 #endif
 
 #if !BEND_HIP
-#define gpu_enter()
+#define gpu_enter(k)
 #define gpu_leave()
 #endif
 
@@ -5334,22 +5334,42 @@ static bool gpu_probe(void) {
 // filled. A chunk no turn has left behind yet is dirty, as it always was.
 // An upload may span GPU_GAP clean chunks between dirty ones: 0, as the
 // particles at 262,144 lost more to the bytes than they saved in calls.
-#define GPU_CHUNK (1ull << 18)
-#define GPU_GAP   0
-#define GPU_DIRTY 0
-#define GPU_STALE 1
-#define GPU_CLEAN 2
+// BEND_GPU_PREFETCH=1: a leave also brings down, in runs, what the host
+// touched after the last leave of the same bang (its key). Such a chunk is
+// fetched: current, still trapping, opened by a touch with no copy, never
+// sent up. =2 fetches every chunk.
+#define GPU_CHUNK   (1ull << 18)
+#define GPU_GAP     0
+#define GPU_DIRTY   0
+#define GPU_CLEAN   1
+#define GPU_STALE   2  // stale and fetched trap; no upload spans them
+#define GPU_FETCHED 3
+#define GPU_KEYS    8
+#define GPU_BIT(m, c) ((m)[(c) >> 6] >> ((c) & 63) & 1)
 static u8*   gpu_state;       // a GPU_ state a tracked chunk; calloc is dirty
 static char* gpu_alias;
 static u64   gpu_lo, gpu_hi;  // the tracked bytes of the corpus, whole chunks
 static u32   gpu_fault_lock;
+static u32   gpu_pf, gpu_key;   // BEND_GPU_PREFETCH; the entered bang's fid
+static u64   gpu_words;         // a chunk bitmap's u64s
+static u64*  gpu_cur;           // the chunks the host touched since the leave
+typedef struct {
+  u32 key;
+  u64 last, *hist;  // its last leave; its last interval's touches
+  unsigned long long demand, hits, used, unused, chunks, runs, copy_ns,
+    touch_ns;
+} GpuKey;
+static GpuKey  gpu_keys[GPU_KEYS];  // the least recently left goes first
+static GpuKey* gpu_at;              // the key whose leave opened the interval
 
 // BEND_GPU_STATS=1: at exit, what the turns cost, by region and way
 static bool gpu_stat;
-static u32  gpu_part;  // 0 header, 1 rings, 2 heap, 3 banks
+// 0 header, 1 rings, 2 heap, 3 banks, 4 prefetch: down the leaves' copies,
+// up the first touches of fetched chunks (no bytes, an mprotect)
+static u32  gpu_part;
 static u64  gpu_turns, gpu_faults, gpu_dev_ns;
 static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
-static u64  gpu_calls[4][2], gpu_bytes[4][2], gpu_ns[4][2];
+static u64  gpu_calls[5][2], gpu_bytes[5][2], gpu_ns[5][2];
 static u64  io_tick(void);
 
 static void gpu_tally(u32 k, bool up, u64 bytes, u64 t0) {
@@ -5358,8 +5378,21 @@ static void gpu_tally(u32 k, bool up, u64 bytes, u64 t0) {
   gpu_ns[k][up]    += io_tick() - t0;
 }
 
+// the fetched chunks nobody touched: at an enter or at exit, unused
+static u64 gpu_unused(void) {
+  u64 u = 0;
+  for (u64 c = 0; c < (gpu_hi - gpu_lo) / GPU_CHUNK; c += 1) {
+    u += gpu_state[c] == GPU_FETCHED;
+  }
+  return u;
+}
+
 static void gpu_stats(void) {
-  static const char* part[4] = { "header", "rings ", "heap  ", "banks " };
+  static const char* part[5] = { "header", "rings ", "heap  ", "banks ",
+    "prefetch" };
+  if (gpu_at != NULL) {
+    gpu_at->unused += gpu_unused();
+  }
   fprintf(stderr, "bend: hip %llu turns, passes %llu us, %llu chunk faults"
     " (%llu writes), %llu clean to dirty, %llu served already, %llu chunks up"
     " (%llu a turn)\n", (unsigned long long)gpu_turns,
@@ -5368,7 +5401,7 @@ static void gpu_stats(void) {
     (unsigned long long)gpu_served,
     (unsigned long long)gpu_sent,
     (unsigned long long)(gpu_sent / (gpu_turns ? gpu_turns : 1)));
-  for (u32 k = 0; k < 4; k += 1) {
+  for (u32 k = 0; k < 5; k += 1) {
     fprintf(stderr, "bend: hip   %s", part[k]);
     for (u32 up = 2; up-- > 0;) {
       fprintf(stderr, " %s %llu calls %llu KB %llu us%s", up ? "up" : "down",
@@ -5376,6 +5409,14 @@ static void gpu_stats(void) {
         (unsigned long long)(gpu_bytes[k][up] >> 10),
         (unsigned long long)(gpu_ns[k][up] / 1000), up ? "," : "\n");
     }
+  }
+  for (GpuKey* k = gpu_keys; k < gpu_keys + GPU_KEYS && k->hist; k += 1) {
+    fprintf(stderr, "bend: hip   key %u: %llu demand (%llu in history), %llu"
+      " used, %llu unused, %llu fetched in %llu runs %llu us, touch %llu us,"
+      " coverage %.1f%%, waste %.1f%%\n", k->key, k->demand, k->hits, k->used,
+      k->unused, k->chunks, k->runs, k->copy_ns / 1000, k->touch_ns / 1000,
+      100.0 * k->used / (k->used + k->demand + !k->used),
+      100.0 * k->unused / (k->chunks + !k->chunks));
   }
 }
 
@@ -5469,6 +5510,8 @@ static void gpu_load(u64 bytes) {
   if (hipModuleGetFunction(&gpu_pso, gpu_lib, "bend_dev") != hipSuccess) {
     err_fail("cannot load the GPU program");
   }
+  const char* pf = getenv("BEND_GPU_PREFETCH");
+  gpu_pf   = pf == NULL ? 0 : (u32)atoi(pf);
   gpu_stat = getenv("BEND_GPU_STATS") != NULL;
   if (gpu_stat) {
     atexit(gpu_stats);
@@ -5515,6 +5558,76 @@ static void gpu_rings(bool up) {
   }
 }
 
+// At a leave, under gpu_fault_lock, every chunk under n stale: the key's
+// slot (a new key takes the least recently left, empty), then its history
+// under n comes down in runs, fetched.
+static void gpu_fetch(u64 n) {
+  GpuKey* k = gpu_keys;
+  for (GpuKey* s = gpu_keys; s < gpu_keys + GPU_KEYS; s += 1) {
+    if (s->hist != NULL && s->key == gpu_key) {
+      k = s;
+      break;
+    }
+    k = s->last < k->last ? s : k;
+  }
+  if (k->hist == NULL || k->key != gpu_key) {
+    u64* h = k->hist != NULL ? k->hist : calloc(gpu_words, 8);
+    if (h == NULL) {
+      err_fail("corpus reservation failed");
+    }
+    memset(h, 0, gpu_words * 8);
+    *k = (GpuKey){ .key = gpu_key, .hist = h };
+  }
+  k->last = gpu_turns;
+  gpu_at  = k;
+  u64 ns  = gpu_ns[4][0];
+  for (u64 c = 0; gpu_pf != 0 && c < n; c += 1) {
+    u64 lo = c, at = gpu_lo + c * GPU_CHUNK, t0 = gpu_stat ? io_tick() : 0;
+    while (c < n && (gpu_pf == 2 || GPU_BIT(k->hist, c))) {
+      c += 1;
+    }
+    if (c > lo) {
+      if (hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, (c - lo) * GPU_CHUNK,
+        hipMemcpyDeviceToHost) != hipSuccess) {
+        err_fail("corpus copy failed");
+      }
+      memset(gpu_state + lo, GPU_FETCHED, c - lo);
+      k->chunks += c - lo;
+      k->runs   += 1;
+      if (gpu_stat) {
+        gpu_tally(4, false, (c - lo) * GPU_CHUNK, t0);
+      }
+    }
+  }
+  k->copy_ns += gpu_ns[4][0] - ns;
+}
+
+// Under gpu_fault_lock: the host touched chunk c, fetched (used) or not
+static void gpu_touch(u64 c, bool used, u64 t0) {
+  if (gpu_at != NULL) {
+    gpu_cur[c >> 6] |= 1ull << (c & 63);
+    gpu_at->used   += used;
+    gpu_at->demand += !used;
+    gpu_at->hits   += !used && GPU_BIT(gpu_at->hist, c);
+    if (used && gpu_stat) {
+      gpu_tally(4, true, 0, t0);
+      gpu_at->touch_ns += io_tick() - t0;
+    }
+  }
+}
+
+// At an enter the interval ends: its touches become the history of the key
+// whose leave opened it
+static void gpu_publish(void) {
+  if (gpu_at != NULL) {
+    gpu_at->unused += gpu_unused();
+    u64* h = gpu_at->hist;
+    gpu_at->hist = gpu_cur;
+    gpu_cur      = h;
+    memset(gpu_cur, 0, gpu_words * 8);
+  }
+}
+
 // The static image and the heap up to the word end. The tracked chunks are
 // the whole ones within the heap; what lies outside them goes eagerly.
 static void gpu_heap(u64 end, bool up) {
@@ -5524,8 +5637,10 @@ static void gpu_heap(u64 end, bool up) {
     gpu_lo = (HEAP_OFF * 8 + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
     gpu_hi = ((HEAP_OFF + (cap << PAGE_BITS)) * 8) & ~(GPU_CHUNK - 1);
     gpu_hi = gpu_hi < gpu_lo ? gpu_lo : gpu_hi;
+    gpu_words = ((gpu_hi - gpu_lo) / GPU_CHUNK + 64) / 64;
     gpu_state = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
-    if (gpu_state == NULL) {
+    gpu_cur   = calloc(gpu_words, 8);
+    if (gpu_state == NULL || gpu_cur == NULL) {
       err_fail("corpus reservation failed");
     }
   }
@@ -5543,7 +5658,7 @@ static void gpu_heap(u64 end, bool up) {
     }
     u64 lo = c;
     u64 hi = c;
-    for (; c < n && c <= hi + GPU_GAP && gpu_state[c] != GPU_STALE; c += 1) {
+    for (; c < n && c <= hi + GPU_GAP && gpu_state[c] < GPU_STALE; c += 1) {
       hi = gpu_state[c] == GPU_DIRTY ? c + 1 : hi;
     }
     gpu_sent += hi - lo;
@@ -5551,16 +5666,19 @@ static void gpu_heap(u64 end, bool up) {
     c = hi;
   }
   // Plain stores: no host thread runs during a turn (see gpu_fault)
-  if (!up && n != 0) {
+  if (!up) {
     LOCK(gpu_fault_lock);
-    if (mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
+    if (n != 0 && mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
       err_fail("corpus protection failed");
     }
     memset(gpu_state, GPU_STALE, n);
+    gpu_fetch(n);
     UNLOCK(gpu_fault_lock);
   }
 }
 
+// Fetched: as stale, with no copy; the touch counts as used once, as the
+// state leaves fetched once, under the lock.
 // Stale: download under the lock; a write: read-write, dirty; else read
 // only, clean. Clean and a write: read-write, then dirty, with no lock: no
 // bytes move, two writers make the same change, and a download of another
@@ -5589,6 +5707,21 @@ static bool gpu_fault(void* addr, u32 wr) {
     }
     return ok;
   }
+  if (s == GPU_FETCHED) {
+    LOCK(gpu_fault_lock);
+    if (__atomic_load_n(st, __ATOMIC_RELAXED) == GPU_FETCHED) {
+      u64 t0 = gpu_stat ? io_tick() : 0;
+      ok = mprotect((char*)CORPUS + at, GPU_CHUNK,
+        wr == 1 ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
+      if (ok) {
+        __atomic_store_n(st, wr == 1 ? GPU_DIRTY : GPU_CLEAN,
+          __ATOMIC_RELEASE);
+        gpu_touch(c, true, t0);
+      }
+    }
+    UNLOCK(gpu_fault_lock);
+    return ok;
+  }
   if (s == GPU_STALE) {
     LOCK(gpu_fault_lock);
     s = __atomic_load_n(st, __ATOMIC_RELAXED);
@@ -5600,6 +5733,9 @@ static bool gpu_fault(void* addr, u32 wr) {
         && mprotect((char*)CORPUS + at, GPU_CHUNK,
           wr == 1 ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
       __atomic_store_n(st, ok ? to : GPU_STALE, __ATOMIC_RELEASE);
+      if (ok) {
+        gpu_touch(c, false, t0);
+      }
       if (gpu_stat) {
         gpu_faults += 1;
         gpu_wrote  += wr == 1;
@@ -5618,6 +5754,9 @@ static bool gpu_fault(void* addr, u32 wr) {
 static void gpu_sync(bool up) {
   Corpus H = CORPUS;
   gpu_turns += up;
+  if (up) {
+    gpu_publish();
+  }
   gpu_part = 0;
   gpu_copy(0, ALC_OFF, up);
   gpu_part = 1;
@@ -5637,7 +5776,7 @@ static void gpu_sync(bool up) {
   gpu_part = 0;
 }
 
-#define gpu_enter() gpu_sync(true)
+#define gpu_enter(k) (gpu_key = (k), gpu_sync(true))
 #define gpu_leave() gpu_sync(false)
 
 static void gpu_kernel(u32 pass, u32 groups) {
@@ -5854,7 +5993,7 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
         H[tl]     = TERM_HOLE;
         a32_store(a32_at(H, H_CURSOR), 1);
         ring_push(H, 0, t);
-        gpu_enter();
+        gpu_enter((u32)term_aux(t));
         cube_run(H, true);
         gpu_leave();
         Term p = task_deliver(H, cont, idx, rv, root_take(H, rv));

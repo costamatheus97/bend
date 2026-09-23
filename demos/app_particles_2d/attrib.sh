@@ -72,15 +72,15 @@ after('      u8  to = wr == 1 ? GPU_DIRTY : GPU_CLEAN;\n',
 at('        hipMemcpyDeviceToHost) == hipSuccess\n        && mprotect(',
   '        hipMemcpyDeviceToHost) == hipSuccess\n'
   '        && (!gpu_stat || at_fault(c, addr, wr == 1))\n        && mprotect(')
-at('  gpu_part = 0;\n}\n\n#define gpu_enter() gpu_sync(true)',
+at('  gpu_part = 0;\n}\n\n#define gpu_enter(k) (gpu_key = (k), gpu_sync(true))',
   '  gpu_part = 0;\n  if (gpu_stat && up) {\n    at_enter();\n  }\n}\n\n'
-  '#define gpu_enter() gpu_sync(true)')
-at('        gpu_enter();\n        cube_run(H, true);\n        gpu_leave();\n',
+  '#define gpu_enter(k) (gpu_key = (k), gpu_sync(true))')
+at('        gpu_enter((u32)term_aux(t));\n        cube_run(H, true);\n        gpu_leave();\n',
   '        at_argn = fid_arity((u32)term_aux(t));\n'
   '        at_argn = at_argn < 8 ? at_argn : 8;\n'
   '        for (u32 j = 0; j < 8; j += 1) {\n'
   '          at_arg[j] = j < at_argn ? H[term_loc(t) + j] : 0;\n'
-  '        }\n        gpu_enter();\n'
+  '        }\n        gpu_enter((u32)term_aux(t));\n'
   '        cube_run(H, true);\n        gpu_leave();\n        at_leave();\n')
 open(path, 'w').write(s)
 PY
