@@ -1,22 +1,22 @@
 # Runtime
 # 2026-09-23 b89bbc46 bun bend2/docs/gen_pins.ts runtime --no-lean; every column built by /opt/rocm/llvm/bin/clang, PAR-GPU on the HIP lane; --gpu-span hashmap=8GB; --gpu-span tree-matmul=8GB; --gpu-span tree-radix=8GB; HEAD b89bbc46: stage 2 + pinning (on by default), WSL2, Ryzen 7 5800XT 16 threads + RX 7800 XT
-# 2026-09-23 24d830dd bun bend2/docs/gen_pins.ts runtime --col PAR-GPU --no-lean; every column built by /opt/rocm/llvm/bin/clang, PAR-GPU on the HIP lane; --gpu-span hashmap=8GB; --gpu-span tree-matmul=8GB; --gpu-span tree-radix=8GB; PAR-GPU at HEAD 24d830dd: stage 2 + pinning + incremental + adaptive rent-or-buy pinning (on by default)
+# 2026-09-23 e750db3a bun bend2/docs/gen_pins.ts runtime --col PAR-GPU --no-lean; every column built by /opt/rocm/llvm/bin/clang, PAR-GPU on the HIP lane; --gpu-span hashmap=8GB; --gpu-span tree-matmul=8GB; --gpu-span tree-radix=8GB; PAR-GPU at HEAD e750db3a: stage 2 + adaptive pinning (on by default) + the WSL PATH fix
 
 | bench        | SEQ-CPU         | PAR-CPU         | PAR-GPU         | C        | TS       |
 |--------------|-----------------|-----------------|-----------------|----------|----------|
-| bfs          |   4.577s   2.1M |   0.453s   2.4M |   0.922s  92.9M |   3.797s |   7.642s |
-| editdist     |   2.410s   2.2M |   0.391s   2.5M |   1.370s  93.0M |   2.191s |   3.358s |
-| gameoflife   |   9.720s   2.2M |   1.252s   2.3M |   0.616s  92.5M |   8.387s |  28.862s |
-| hashmap      |   3.401s   2.4M |   0.383s   8.2M |   1.260s  95.5M |   0.917s |   1.345s |
-| kmeans       |   5.153s  20.4M |   0.792s  20.2M |   0.766s  92.6M |   5.107s |  33.927s |
-| lexer        |   3.555s   2.0M |   0.436s   2.3M |   1.560s  92.7M |   1.163s |   6.424s |
-| mandelbrot   |   4.861s   2.4M |   0.523s   2.5M |   0.632s  92.4M |   3.882s |   4.792s |
-| merkle       |   5.712s   130M |   0.596s   130M |   0.643s  94.0M |   4.051s |  10.422s |
-| nbody        |   7.027s   2.2M |   0.606s   2.3M |   0.626s  92.4M |   6.195s |   8.196s |
-| queens       |   9.220s   2.1M |   1.123s   2.2M |   1.822s  92.4M |   3.753s |   9.091s |
-| raytrace     |   7.726s   2.2M |   0.782s   2.3M |   0.679s  92.4M |   7.064s |  30.994s |
-| symreg       |   5.022s   2.1M |   0.555s   2.2M |   0.936s  92.3M |   3.536s |   7.389s |
-| terrain      |   3.255s   2.2M |   0.388s   2.4M |   1.100s  92.5M |   2.667s |   8.073s |
-| tree-bitonic |  12.545s   140M |   2.248s   156M |   1.991s  93.2M |   8.717s |  75.822s |
-| tree-matmul  |   4.020s   2.8M |   0.633s  14.0M |   1.024s  94.9M |   4.635s |  18.324s |
-| tree-radix   |   6.974s   651M |   1.085s   617M |   1.085s  97.6M |   5.753s |  14.369s |
+| bfs          |   4.577s   2.1M |   0.453s   2.4M |   0.364s  92.7M |   3.797s |   7.642s |
+| editdist     |   2.410s   2.2M |   0.391s   2.5M |   0.823s  93.0M |   2.191s |   3.358s |
+| gameoflife   |   9.720s   2.2M |   1.252s   2.3M |   0.140s  92.6M |   8.387s |  28.862s |
+| hashmap      |   3.401s   2.4M |   0.383s   8.2M |   0.745s  95.8M |   0.917s |   1.345s |
+| kmeans       |   5.153s  20.4M |   0.792s  20.2M |   0.258s  93.0M |   5.107s |  33.927s |
+| lexer        |   3.555s   2.0M |   0.436s   2.3M |   1.083s  92.7M |   1.163s |   6.424s |
+| mandelbrot   |   4.861s   2.4M |   0.523s   2.5M |   0.133s  92.5M |   3.882s |   4.792s |
+| merkle       |   5.712s   130M |   0.596s   130M |   0.140s  94.0M |   4.051s |  10.422s |
+| nbody        |   7.027s   2.2M |   0.606s   2.3M |   0.132s  92.7M |   6.195s |   8.196s |
+| queens       |   9.220s   2.1M |   1.123s   2.2M |   1.346s  92.6M |   3.753s |   9.091s |
+| raytrace     |   7.726s   2.2M |   0.782s   2.3M |   0.199s  92.6M |   7.064s |  30.994s |
+| symreg       |   5.022s   2.1M |   0.555s   2.2M |   0.436s  92.7M |   3.536s |   7.389s |
+| terrain      |   3.255s   2.2M |   0.388s   2.4M |   0.597s  92.4M |   2.667s |   8.073s |
+| tree-bitonic |  12.545s   140M |   2.248s   156M |   1.535s  93.2M |   8.717s |  75.822s |
+| tree-matmul  |   4.020s   2.8M |   0.633s  14.0M |   0.524s  95.3M |   4.635s |  18.324s |
+| tree-radix   |   6.974s   651M |   1.085s   617M |   0.600s  97.9M |   5.753s |  14.369s |
