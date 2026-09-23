@@ -1,7 +1,8 @@
 # Particles 2D: a pure particle bang, host projection/binning, and a pure
-# raster bang per frame. PARTICLES_SCALE selects 16384, 65536 (default),
-# or 262144 particles. PARTICLES_PROBE=N runs N measured headless frames
-# after eight warmups and prints stage medians plus deterministic checksums.
+# raster bang per frame. PARTICLES_SCALE selects 1024, 4096, 16384, 65536
+# (default), 262144 or 1048576 particles, a quadtree of depth 3 to 8 with 16
+# per leaf. PARTICLES_PROBE=N runs N measured headless frames after eight
+# warmups and prints stage medians plus deterministic checksums.
 import Base
 import ../app_slash_boss_3d/bend3d.bend as R
 
@@ -22,6 +23,12 @@ def Screen.h() -> U32:
 def Particles.k() -> Nat:
   16n
 
+def Depth.tiny() -> Nat:
+  3n
+
+def Depth.little() -> Nat:
+  4n
+
 def Depth.small() -> Nat:
   5n
 
@@ -30,6 +37,9 @@ def Depth.medium() -> Nat:
 
 def Depth.large() -> Nat:
   7n
+
+def Depth.huge() -> Nat:
+  8n
 
 def Scale.total(~k: Nat, +depth: Nat) -> U32:
   U32.shln(U32.from_nat(k), Nat.mul(depth, 2n))
@@ -147,6 +157,12 @@ def Sim.node(d: Nat, w: World) -> World:
 def Sim.run(~depth: Nat, +w: World) -> World:
   Sim.node!(depth, w)
 
+def Sim.d3(+w: World) -> World:
+  Sim.run(~Depth.tiny, w)
+
+def Sim.d4(+w: World) -> World:
+  Sim.run(~Depth.little, w)
+
 def Sim.d5(+w: World) -> World:
   Sim.run(~Depth.small, w)
 
@@ -155,6 +171,9 @@ def Sim.d6(+w: World) -> World:
 
 def Sim.d7(+w: World) -> World:
   Sim.run(~Depth.large, w)
+
+def Sim.d8(+w: World) -> World:
+  Sim.run(~Depth.huge, w)
 
 def Parts.count(ps: Parts) -> Nat:
   match ps:
@@ -209,6 +228,12 @@ def Scene.build(~depth: Nat, +world: World, used: R.Cells) -> R.Cells:
   fresh gone = Bin.node(depth, world) R.Cells.drop(4n, used)
   R.Cells.merge(fresh, gone)
 
+def Scene.d3(+world: World, used: R.Cells) -> R.Cells:
+  Scene.build(~Depth.tiny, world, used)
+
+def Scene.d4(+world: World, used: R.Cells) -> R.Cells:
+  Scene.build(~Depth.little, world, used)
+
 def Scene.d5(+world: World, used: R.Cells) -> R.Cells:
   Scene.build(~Depth.small, world, used)
 
@@ -217,6 +242,9 @@ def Scene.d6(+world: World, used: R.Cells) -> R.Cells:
 
 def Scene.d7(+world: World, used: R.Cells) -> R.Cells:
   Scene.build(~Depth.large, world, used)
+
+def Scene.d8(+world: World, used: R.Cells) -> R.Cells:
+  Scene.build(~Depth.huge, world, used)
 
 def Hook.sim() -> Type:
   @+world: World -> World
@@ -412,15 +440,23 @@ def Main.mode(
     case Done{text}:
       Probe.run(~depth, ~sim, ~bin, Env.u32(U32.read(text), 120))
 
+# The first flag set picks its depth; none picks the default, depth 6.
 def Main.scale(
-  small: Bool, large: Bool, probe: Result<&1, &1, U32 & String, String>
+  tiny: Bool, little: Bool, small: Bool, large: Bool, huge: Bool,
+  probe: Result<&1, &1, U32 & String, String>
 ) -> IO(Unit):
-  match small large:
-    case True{} _:
+  match tiny little small large huge:
+    case True{} _ _ _ _:
+      Main.mode(~Depth.tiny, ~Sim.d3, ~Scene.d3, probe)
+    case _ True{} _ _ _:
+      Main.mode(~Depth.little, ~Sim.d4, ~Scene.d4, probe)
+    case _ _ True{} _ _:
       Main.mode(~Depth.small, ~Sim.d5, ~Scene.d5, probe)
-    case _ True{}:
+    case _ _ _ True{} _:
       Main.mode(~Depth.large, ~Sim.d7, ~Scene.d7, probe)
-    case _ _:
+    case _ _ _ _ True{}:
+      Main.mode(~Depth.huge, ~Sim.d8, ~Scene.d8, probe)
+    case _ _ _ _ _:
       Main.mode(~Depth.medium, ~Sim.d6, ~Scene.d6, probe)
 
 def main() -> IO(Unit):
@@ -428,4 +464,5 @@ def main() -> IO(Unit):
     scale_env : Result<&1, &1, U32 & String, String> <- IO.get_env("PARTICLES_SCALE")
     probe : Result<&1, &1, U32 & String, String> <- IO.get_env("PARTICLES_PROBE")
     +scale : U32 = Env.num(scale_env, 65536)
-    Main.scale(U32.is_eq(scale, 16384), U32.is_eq(scale, 262144), probe)
+    Main.scale(U32.is_eq(scale, 1024), U32.is_eq(scale, 4096), U32.is_eq(scale, 16384),
+      U32.is_eq(scale, 262144), U32.is_eq(scale, 1048576), probe)

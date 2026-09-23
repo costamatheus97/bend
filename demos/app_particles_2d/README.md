@@ -19,8 +19,9 @@ CC=/opt/rocm/llvm/bin/clang bun bend2/main.ts demos/app_particles_2d/main.bend -
 ```
 
 Run `/tmp/particles --gpu 3GB` for the window; Esc closes it.
-`PARTICLES_SCALE` selects 16384, 65536 or 262144 particles. `PARTICLES_PROBE=N`
-runs N measured frames after eight warmup frames, without opening a window.
+`PARTICLES_SCALE` selects 1024, 4096, 16384, 65536 (default), 262144 or
+1048576 particles. `PARTICLES_PROBE=N` runs N measured frames after eight
+warmup frames, without opening a window.
 `--gpu off` explicitly selects the CPU pool.
 
 Run `bash demos/app_particles_2d/run_gpu.sh` on the GPU host. It rebuilds,
