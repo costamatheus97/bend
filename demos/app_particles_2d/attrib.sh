@@ -15,7 +15,7 @@ export CC=${CC:-/opt/rocm/llvm/bin/clang}
 rocm=${ROCM_PATH:-/opt/rocm}
 libs=()
 cd "$root"
-git rev-parse HEAD > "$out/head.txt"
+{ git rev-parse HEAD; git status --short; } > "$out/head.txt"  # dirty: listed
 bun bend2/main.ts demos/app_particles_2d/main.bend -o "$out/particles.c" > "$out/emit.log" 2>&1
 python3 - "$out/particles.c" demos/app_particles_2d/{attrib,reach,record,writes,tally}.c <<'PY'
 import re, sys

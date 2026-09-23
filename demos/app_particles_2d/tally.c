@@ -123,13 +123,14 @@ static void wr_exit(void) {
       " bytes; words A %.0f F %.0f P %.0f L %.0f (low 24 bits %.0f), lines"
       " with L %.1f; the result met %.0f A words\n", tn[p], t[0] / f,
       t[1] / f, t[2] / f, t[3] / f, t[4] / f, t[5] / f, t[6] / f, t[7] / f,
-      t[8] / f, t[11] / f);
-    fprintf(stderr, "attrib: w2 %s A words adopted %.0f own %.0f past the"
-      " bump %.0f; chunks with them %.1f %.1f %.1f; the result met %.0f"
-      " distinct A words in %.1f chunks; walks us: result strict %.0f full"
-      " %.0f, borrowed argument %.0f\n", tn[p], t[9] / f, t[10] / f,
-      (t[3] - t[9] - t[10]) / f, t[14] / f, t[15] / f, t[16] / f, t[12] / f,
-      t[13] / f, at_tw[p][0] / f, at_tw[p][1] / f, at_tw[p][2] / f);
+      t[8] / f, t[12] / f);
+    fprintf(stderr, "attrib: w2 %s A words adopted %.0f own %.0f carried"
+      " %.0f past the bump %.0f; chunks with them %.1f %.1f %.1f %.1f; the"
+      " result met %.0f distinct A words in %.1f chunks; walks us: result"
+      " strict %.0f full %.0f, borrowed argument %.0f\n", tn[p], t[9] / f,
+      t[10] / f, t[11] / f, (t[3] - t[9] - t[10] - t[11]) / f, t[15] / f,
+      t[16] / f, t[18] / f, t[17] / f, t[13] / f, t[14] / f,
+      at_tw[p][0] / f, at_tw[p][1] / f, at_tw[p][2] / f);
     for (u32 v = 0; v < 8; v += 1) {
       fprintf(stderr, "attrib: w pf %s %u chunks unwritten %.1f, A F P %.1f,"
         " L %.1f; unused %.1f\n", tn[p], v, at_wpf[p][v][0] / f,
@@ -154,10 +155,10 @@ static void wr_exit(void) {
         i >> 6 & 63, i >> 5 & 1, i >> 4 & 1, i >> 1 & 7, i & 1, x / f);
     }
   }
-  for (u32 i = 0; i < 32; i += 1) {  // ph src other
+  for (u32 i = 0; i < 64; i += 1) {  // ph src other
     u64 x = (&at_wsd[0][0][0])[i];
     if (x != 0) {
-      fprintf(stderr, "attrib: ws %u %u %u %.3f\n", i >> 4, i >> 1 & 7,
+      fprintf(stderr, "attrib: ws %u %u %u %.3f\n", i >> 5, i >> 1 & 15,
         i & 1, x / f);
     }
   }
