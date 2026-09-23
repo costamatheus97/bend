@@ -5386,10 +5386,52 @@ static void gpu_pass(u32 f) {
 // out: every Loc is an index, and the host never runs during a device turn.
 static Corpus gpu_vram;
 
+// comgr (CLR's blit kernels at the first device op; hiprtc's link) scans
+// every PATH entry for ld.lld, four times, and then uses its own. Under
+// WSL (/dev/dxg) the Windows /mnt/ entries cost ~2 ms each through 9p:
+// ~0.5 s at the first op (mandelbrot 0.72 s, 0.21 without them). So the
+// setup runs without them, and the user's PATH is back (drop false) once
+// the module is loaded, or at once if there is no device. The drop runs
+// in main before any thread (HIP's start in hipInit, ours after setup);
+// the restore replaces PATH in place, which glibc does without freeing
+// the old string a HIP thread's getenv might hold.
+static char* gpu_env_path;
+static void gpu_env(bool drop) {
+  const char* p = getenv("PATH");
+  char*       q = drop && p != NULL && access("/dev/dxg", F_OK) == 0
+    ? malloc(strlen(p) + 1) : NULL;
+  char*       w = q;
+  for (const char* s = p, *e; q != NULL; s = e + 1) {
+    e = strchr(s, ':') != NULL ? strchr(s, ':') : s + strlen(s);
+    if (e - s < 5 || strncmp(s, "/mnt/", 5) != 0) {
+      memcpy(w, s, e - s);
+      w += e - s;
+      *w++ = ':';
+    }
+    if (*e == '\0') {
+      break;
+    }
+  }
+  if (q != NULL && (gpu_env_path = strdup(p)) != NULL) {
+    w[w > q ? -1 : 0] = '\0';
+    setenv("PATH", q, 1);
+  } else if (!drop && gpu_env_path != NULL) {
+    setenv("PATH", gpu_env_path, 1);
+    free(gpu_env_path);
+    gpu_env_path = NULL;
+  }
+  free(q);
+}
+
 static bool gpu_probe(void) {
   int n = 0;
-  return hipInit(0) == hipSuccess && hipGetDeviceCount(&n) == hipSuccess
+  gpu_env(true);
+  bool ok = hipInit(0) == hipSuccess && hipGetDeviceCount(&n) == hipSuccess
     && n > 0 && hipSetDevice(gpu_dev) == hipSuccess;
+  if (!ok) {
+    gpu_env(false);
+  }
+  return ok;
 }
 
 // The twin's heap is lazy. A turn's enter uploads the dirty chunks and
@@ -5584,6 +5626,7 @@ static bool gpu_make(const char* path) {
     err_fail("cannot load the HIP library");
   }
   free(bin);
+  gpu_env(false);
   return path == NULL || ok;
 }
 
@@ -5610,6 +5653,7 @@ static void gpu_load(u64 bytes) {
   if (hipModuleGetFunction(&gpu_pso, gpu_lib, "bend_dev") != hipSuccess) {
     err_fail("cannot load the GPU program");
   }
+  gpu_env(false);
   const char* pf = getenv("BEND_GPU_PREFETCH");
   gpu_pf   = pf == NULL ? 0 : (u32)atoi(pf);
   gpu_stat = getenv("BEND_GPU_STATS") != NULL;
