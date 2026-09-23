@@ -14,7 +14,9 @@
 // the same way (render the film after) and its comment names the
 // stamps. A checker timeout (>=300 s) is quoted as 300 and flagged
 // over. gen_gifs.ts imports the pin readers below: they are the one
-// source of every bar and figure.
+// source of every bar and figure. A pin may lack the Lean column (NaN
+// then) and hold "-" for a cell that could not run (NaN too); runtime_pin
+// names another machine's pin, as gen_gifs.ts --pin draws it.
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -23,8 +25,9 @@ import * as path from "node:path";
 // =========
 
 export const ROOT = path.join(import.meta.dirname, "..", "..");
-export const RUNTIME_PIN = path.join(ROOT, "bench", "runtime", "_pin_",
-  "apple_m4_max.txt");
+export const runtime_pin = (hw: string): string =>
+  path.join(ROOT, "bench", "runtime", "_pin_", hw + ".txt");
+export const RUNTIME_PIN = runtime_pin("apple_m4_max");
 export const CHECKER_PIN = path.join(ROOT, "bench", "checker", "_pin_",
   "apple_m4_max.txt");
 export const CHECK_TIMEOUT = 300;
@@ -66,6 +69,9 @@ function pin_grid(file: string, heads: string[]): [string, string[]][] {
 }
 
 function pin_secs(cell: string): number {
+  if (cell === "-") {
+    return NaN;
+  }
   const got = /^(>?)([\d.]+)s/.exec(cell);
   if (got === null) {
     throw new Error("unreadable pin cell: " + cell);
@@ -73,11 +79,12 @@ function pin_secs(cell: string): number {
   return Number(got[2]);
 }
 
-export function pin_runtime(): RunRow[] {
-  return pin_grid(RUNTIME_PIN, ["bench", "SEQ-CPU", "PAR-CPU",
-    "PAR-GPU", "C", "TS", "Lean"]).map(([bench, c]) => ({
+export function pin_runtime(file = RUNTIME_PIN): RunRow[] {
+  const lean = /\| Lean +\|/.test(fs.readFileSync(file, "utf8"));
+  return pin_grid(file, ["bench", "SEQ-CPU", "PAR-CPU", "PAR-GPU", "C",
+    "TS", ...lean ? ["Lean"] : []]).map(([bench, c]) => ({
     bench, seq: pin_secs(c[0]), par: pin_secs(c[1]), gpu: pin_secs(c[2]),
-    c: pin_secs(c[3]), ts: pin_secs(c[4]), lean: pin_secs(c[5]),
+    c: pin_secs(c[3]), ts: pin_secs(c[4]), lean: lean ? pin_secs(c[5]) : NaN,
   }));
 }
 

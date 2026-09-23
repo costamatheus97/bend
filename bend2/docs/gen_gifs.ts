@@ -22,6 +22,12 @@
 //   ssh -J cluster cluster-9d 'cd film && \
 //     PATH=/usr/local/node/bin:$PATH:$HOME/film node bend2/docs/gen_gifs.ts'
 //   scp -o ProxyJump=cluster 'cluster-9d:film/media/*.gif' media/
+//
+// --pin <hw> draws only that machine's runtime pin, as media/<--name>.gif
+// (runtime_<hw> by default), with --font for Menlo, --machine for the
+// line under the dots and --par for the "16 cores" of the PAR bar; a pin
+// without Lean has no Lean bar, a "-" cell draws "failed", and a bench the
+// site does not title (no site beside this checkout) is titled by its id.
 
 import * as child from "node:child_process";
 import * as fs from "node:fs";
@@ -59,8 +65,12 @@ const INK = "#87847d";
 const GRAY = "#a5a29a";
 const PURPLE = "#8b83b5";
 const GREEN = "#7e9a5e";
-const MONO = "Menlo, monospace";
-const MACHINE = "Apple M4 Max · lower is better";
+const ARGS = process.argv.slice(2);
+const arg = (o: string): string | undefined =>
+  ARGS.includes("--" + o) ? ARGS[ARGS.indexOf("--" + o) + 1] : undefined;
+const MONO = (arg("font") ?? "Menlo") + ", monospace";
+const MACHINE = arg("machine") ?? "Apple M4 Max · lower is better";
+const PAR = arg("par") ?? "16 cores";
 
 const cv = createCanvas(W * K, H * K);
 const cx = cv.getContext("2d");
@@ -70,8 +80,8 @@ function secs(s: number): string {
   return (s >= 10 ? s.toFixed(1) : s.toFixed(2)) + "s";
 }
 
-function times(x: number): string {
-  return (x >= 10 ? String(Math.round(x)) : x.toFixed(1)) + "x";
+function times(x: number): string | undefined {
+  return Number.isNaN(x) ? undefined : (x >= 10 ? String(Math.round(x)) : x.toFixed(1)) + "x";
 }
 
 function clamp(x: number): number {
@@ -87,17 +97,17 @@ function ease_out(x: number): number {
 
 // every bench, best to worst by Bend's combined advantage: (one core
 // over the best twin) x (GPU over all cores)
-function pages_runtime(): Page[] {
-  const titles = charts.front_titles();
-  const score = (r: charts.RunRow): number =>
-    (r.seq / Math.min(r.c, r.ts, r.lean)) * (r.gpu / r.par);
-  return charts.pin_runtime().sort((a, b) => score(a) - score(b))
-    .map((r): Page => ({ title: titles[r.bench], bars: [
+function pages_runtime(file: string): Page[] {
+  const titles = fs.existsSync(charts.FRONT) ? charts.front_titles() : {};
+  const score = (r: charts.RunRow): number => (r.seq / Math.min(r.c, r.ts,
+    ...Number.isNaN(r.lean) ? [] : [r.lean])) * ((r.gpu || r.par) / r.par);
+  return charts.pin_runtime(file).sort((a, b) => score(a) - score(b))
+    .map((r): Page => ({ title: titles[r.bench] ?? r.bench, bars: [
       { name: "TypeScript", secs: r.ts },
-      { name: "Lean", secs: r.lean },
+      ...Number.isNaN(r.lean) ? [] : [{ name: "Lean", secs: r.lean }],
       { name: "C", secs: r.c },
       { name: "Bend\n1 core", secs: r.seq, bend: true, mul: "1x" },
-      { name: "Bend\n16 cores", secs: r.par, bend: true,
+      { name: "Bend\n" + PAR, secs: r.par, bend: true,
         mul: times(r.seq / r.par) },
       { name: "Bend\nGPU", secs: r.gpu, bend: true,
         mul: times(r.seq / r.gpu) },
@@ -123,13 +133,14 @@ function pages_checker(): Page[] {
 // a bar's height, as a share of the tallest: a timeout fills the chart
 // and halves the rest
 function page_heights(p: Page): number[] {
-  const live = Math.max(...p.bars.map((b) => b.over === true ? 0 : b.secs));
+  const live = Math.max(...p.bars.map((b) => b.over === true ? 0 : b.secs || 0));
   const vmax = live * (p.bars.some((b) => b.over === true) ? 2 : 1);
-  return p.bars.map((b) => b.over === true ? 1 : b.secs / vmax);
+  return p.bars.map((b) => b.over === true ? 1 : b.secs / vmax || 0);
 }
 
 function bar_label(b: Bar): string[] {
-  const value = b.over === true ? ">5 min" : secs(b.secs);
+  const value = b.over === true ? ">5 min"
+    : Number.isNaN(b.secs) ? "failed" : secs(b.secs);
   return b.mul === undefined ? [value] : [b.mul, value];
 }
 
@@ -255,5 +266,10 @@ function gif(name: string, pages: Page[]): void {
 // Main
 // ====
 
-gif("runtime", pages_runtime());
-gif("checker", pages_checker());
+const hw = arg("pin");
+if (hw === undefined) {
+  gif("runtime", pages_runtime(charts.RUNTIME_PIN));
+  gif("checker", pages_checker());
+} else {
+  gif(arg("name") ?? "runtime_" + hw, pages_runtime(charts.runtime_pin(hw)));
+}

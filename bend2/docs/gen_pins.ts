@@ -15,9 +15,19 @@
 // Isabelle, Agda, Lean, Rocq and Bend, 300 s each, a timeout written as >300s.
 // Run it whole or one file at a time; --keep <lang> carries a checker column
 // forward from the file as it is, unmeasured (a prover this machine cannot run
-// today), and the stamp says so:
+// today), and the stamp says so. On Linux the brand comes from /proc/cpuinfo,
+// the space from /usr/bin/time -v, PAR-GPU is the HIP lane (a --gpu-span
+// <bench>=<span> for a bench that runs out of the default), and one clang, $CC
+// else ROCm's (which bend -o finds), builds every column. A PAR-GPU cell that
+// fails or hangs past 300 s runs once more and then pins as "-". --no-lean
+// drops the Lean column, --only <bench> remeasures one row into the file,
+// --col <mode> one Bend column of every row (under a stamp line of its own),
+// and --note <text> ends the stamp; the runtime pin is rewritten after every
+// row:
 //
-//   bun bend2/docs/gen_pins.ts [runtime] [checker] [--keep <lang>]
+//   bun bend2/docs/gen_pins.ts [runtime] [checker] [--keep <lang>] [--no-lean]
+//     [--only <bench>] [--col <mode>] [--gpu-span <bench>=<span>]
+//     [--note <text>]
 
 import * as child from "node:child_process";
 import * as fs from "node:fs";
@@ -36,8 +46,33 @@ const RUNTIME = path.join(ROOT, "bench", "runtime");
 
 const CHECKER = path.join(ROOT, "bench", "checker");
 
-const HW = child.spawnSync("sysctl", ["-n", "machdep.cpu.brand_string"],
-  { encoding: "utf8" }).stdout.trim().toLowerCase().replace(/\s+/g, "_");
+const LINUX = process.platform === "linux";
+
+const ARGS = process.argv.slice(2);
+
+const HW = (LINUX ? /^model name\s*:(.*)$/m.exec(fs.readFileSync("/proc/cpuinfo",
+  "utf8"))?.[1] ?? "" : child.spawnSync("sysctl",
+  ["-n", "machdep.cpu.brand_string"], { encoding: "utf8" }).stdout).trim()
+  .toLowerCase().replace(/[^a-z0-9]+/g, "_");
+
+const LEAN = !ARGS.includes("--no-lean");
+
+const ROCM = process.env.ROCM_PATH || "/opt/rocm";
+
+const CLANG = process.env.CC || ROCM + "/llvm/bin/clang";
+
+// the cc lines of gates/perf.ts, and on Linux bend2/main.ts cli_build's
+const TWIN = LINUX ? CLANG + " -std=c11 -O3" : CC;
+
+const BUILDS = !LINUX ? BUILD : [0, 1, 2].map((m) => TWIN + (m < 2 ? ""
+  : " -DBEND_HIP=1 -D__HIP_PLATFORM_AMD__ -I" + ROCM + "/include -L" + ROCM
+  + "/lib -Wl,-rpath," + ROCM + "/lib") + " main.c -lpthread -lm"
+  + (m < 2 ? "" : " -lamdhip64 -lhiprtc"));
+
+const SPAN: Record<string, string> = { ...MEMORY, ...Object.fromEntries(
+  ARGS.flatMap((a, i) => ARGS[i - 1] === "--gpu-span" ? [a.split("=")] : [])) };
+
+const GPU_DOWN: string[] = [];
 
 const RUN_TIMEOUT = 600;
 
@@ -96,8 +131,9 @@ function exec_run(cmd: string[], cwd: string, timeout: number,
           + outs.slice(-400) + errs.slice(-800)));
       }
       const mem = /(\d+)\s+maximum resident set size/.exec(errs);
-      ok({ secs, out: outs.trim(), over: false,
-        rss: mem === null ? 0 : Number(mem[1]) / (1 << 20) });
+      const kb = /Maximum resident set size \(kbytes\): (\d+)/.exec(errs);
+      ok({ secs, out: outs.trim(), over: false, rss: mem !== null
+        ? Number(mem[1]) / (1 << 20) : kb === null ? 0 : Number(kb[1]) / 1024 });
     });
   });
 }
@@ -150,17 +186,19 @@ function pin_table(heads: string[], rows: string[][]): string[] {
   const wide = heads.map((h, i) =>
     Math.max(h.length, ...rows.map((r) => r[i].length)));
   const line = (cells: string[]): string =>
-    "| " + cells.map((c, i) => c.padEnd(wide[i])).join(" | ") + " |";
+    "| " + cells.map((c, i) => i > 0 && cells !== heads ? c.padStart(wide[i])
+      : c.padEnd(wide[i])).join(" | ") + " |";
   return [line(heads),
     "|" + wide.map((w) => "-".repeat(w + 2)).join("|") + "|",
     ...rows.map(line)];
 }
 
 function pin_write(file: string, name: string, target: string,
-  lines: string[], kept = ""): void {
+  lines: string[], kept = "", prior: string[] = []): void {
   const head = child.spawnSync("git", ["rev-parse", "--short", "HEAD"],
     { cwd: ROOT, encoding: "utf8" }).stdout.trim();
-  fs.writeFileSync(file, "# " + name + "\n# "
+  fs.writeFileSync(file, "# " + name + "\n" + prior.map((l) => l + "\n")
+    .join("") + "# "
     + new Date().toISOString().slice(0, 10) + " " + head
     + " bun bend2/docs/gen_pins.ts " + target + kept + "\n\n"
     + lines.join("\n") + "\n");
@@ -197,21 +235,26 @@ function pin_outs(): Map<string, string> {
 type Built = { bench: string; want: string; f32: boolean; cpu: string;
   gpu: string; cbin: string; lbin: string };
 
+const sleep = (s: number): Promise<void> =>
+  new Promise((ok) => setTimeout(ok, s * 1000));
+
 async function runtime_build(bench: string, want: string,
   dir: string): Promise<Built> {
   const home = path.join(RUNTIME, bench);
   const at = path.join(dir, bench);
   fs.mkdirSync(at);
-  fs.copyFileSync(path.join(home, "main.lean"), path.join(at, "main.lean"));
   await exec_run([process.execPath, MAIN, path.join(home, "main.bend"),
     "-o", "main.c"], at, RUN_TIMEOUT);
-  await exec_run(["sh", "-c", BUILD[0] + " -o cpu"], at, RUN_TIMEOUT);
-  await exec_run(["sh", "-c", BUILD[2] + " -o gpu"], at, RUN_TIMEOUT);
-  await exec_run(["sh", "-c", CC + " " + path.join(home, "main.c")
-    + " -o twin_c"], at, RUN_TIMEOUT);
-  await exec_run(["lean", "main.lean", "-c", "lean.c"], at, RUN_TIMEOUT);
-  await exec_run(["leanc", "-O3", "-DNDEBUG", "lean.c", "-o", "twin_lean"],
-    at, RUN_TIMEOUT);
+  await exec_run(["sh", "-c", BUILDS[0] + " -o cpu"], at, RUN_TIMEOUT);
+  await exec_run(["sh", "-c", BUILDS[2] + " -o gpu"], at, RUN_TIMEOUT);
+  await exec_run(["sh", "-c", TWIN + " " + path.join(home, "main.c")
+    + (LINUX ? " -lm" : "") + " -o twin_c"], at, RUN_TIMEOUT);
+  if (LEAN) {
+    fs.copyFileSync(path.join(home, "main.lean"), path.join(at, "main.lean"));
+    await exec_run(["lean", "main.lean", "-c", "lean.c"], at, RUN_TIMEOUT);
+    await exec_run(["leanc", "-O3", "-DNDEBUG", "lean.c", "-o", "twin_lean"],
+      at, RUN_TIMEOUT);
+  }
   const f32 = fs.readFileSync(path.join(home, "main.bend"), "utf8")
     .includes("F32");
   return { bench, want, f32, cpu: path.join(at, "cpu"),
@@ -228,8 +271,9 @@ function runtime_check(b: Built, what: string, got: Ran): Ran {
 }
 
 // A Bend binary runs in its build directory: the Metal one reads its
-// shader from main.c through __FILE__.
-async function runtime_cell(b: Built, mode: number): Promise<Ran> {
+// shader from main.c through __FILE__. A HIP cell that fails runs again
+// once, alone, then pins as null ("-").
+async function runtime_cell(b: Built, mode: number): Promise<Ran | null> {
   const bin = mode === 2 ? b.gpu : b.cpu;
   const dir = path.dirname(bin);
   let nt = 1;
@@ -237,10 +281,26 @@ async function runtime_cell(b: Built, mode: number): Promise<Ran> {
     nt *= 2;
   }
   const args = FLAGS[mode].replace("$nt", String(nt))
-    .replace("$gm", MEMORY[b.bench] ?? "on").split(" ");
-  await exec_run([bin, ...args], dir, RUN_TIMEOUT);
-  return runtime_check(b, MODES[mode],
-    await exec_run(["/usr/bin/time", "-l", bin, ...args], dir, RUN_TIMEOUT));
+    .replace("$gm", SPAN[b.bench] ?? "on").split(" ");
+  const cap = LINUX && mode === 2 ? ["timeout", "300"] : [];
+  const run = async (): Promise<Ran> => {
+    await exec_run([...cap, bin, ...args], dir, RUN_TIMEOUT);
+    return runtime_check(b, MODES[mode], await exec_run([...cap,
+      "/usr/bin/time", LINUX ? "-v" : "-l", bin, ...args], dir, RUN_TIMEOUT));
+  };
+  for (let n = 0; cap.length > 0 && n < 2; n += 1) {
+    try {
+      return await run();
+    } catch (e) {
+      say(b.bench + " PAR-GPU failed: " + String(e).slice(0, 400));
+      await sleep(10);
+    }
+  }
+  if (cap.length > 0) {
+    GPU_DOWN.push(b.bench);
+    return null;
+  }
+  return run();
 }
 
 async function runtime_ts(b: Built, dir: string): Promise<number> {
@@ -254,12 +314,14 @@ async function runtime_ts(b: Built, dir: string): Promise<number> {
     ? Math.min(bun.secs, node.secs) : bun.secs;
 }
 
-async function runtime_rows(): Promise<string[][]> {
-  exec_need(["cc", "lean", "leanc", "node"]);
+// Every row, or with modes (--col) only those Bend cells, the rest "".
+async function runtime_rows(only: string[], modes: number[],
+  put: (row: string[]) => void): Promise<void> {
+  exec_need([LINUX ? CLANG : "cc", ...LEAN ? ["lean", "leanc"] : [], "node"]);
   const outs = pin_outs();
   const dir = tmp_dir("runtime");
-  const benches = fs.readdirSync(RUNTIME).filter((f) => !f.startsWith("_"))
-    .sort();
+  const benches = fs.readdirSync(RUNTIME).filter((f) => !f.startsWith("_")
+    && (only.length === 0 || only.includes(f))).sort();
   const built: Built[] = [];
   await pool_run(benches.map((bench, i) => async () => {
     const want = outs.get(bench);
@@ -268,11 +330,18 @@ async function runtime_rows(): Promise<string[][]> {
     }
     built[i] = await runtime_build(bench, want, dir);
   }));
-  const rows: string[][] = [];
   for (const b of built) {
     const runs = [];
     for (let mode = 0; mode < 3; mode += 1) {
-      runs.push(await runtime_cell(b, mode));
+      runs.push(modes.length === 0 || modes.includes(mode)
+        ? await runtime_cell(b, mode) : undefined);
+    }
+    const cells = runs.map((r) => r === undefined ? "" : r === null ? "-"
+      : fmt_meas(r));
+    if (modes.length > 0) {
+      put([b.bench, ...cells]);
+      say("runtime " + b.bench + " " + cells.join(" "));
+      continue;
     }
     await exec_run([b.cbin], dir, RUN_TIMEOUT);
     const c = await exec_run([b.cbin], dir, RUN_TIMEOUT);
@@ -280,15 +349,16 @@ async function runtime_rows(): Promise<string[][]> {
       runtime_check(b, "main.c", c);
     }
     const ts = await runtime_ts(b, dir);
-    await exec_run([b.lbin], dir, RUN_TIMEOUT);
-    const lean = runtime_check(b, "main.lean", await exec_run([b.lbin], dir,
-      RUN_TIMEOUT));
-    rows.push([b.bench, ...runs.map(fmt_meas), fmt_secs(c.secs),
-      fmt_secs(ts), fmt_secs(lean.secs)]);
-    say("runtime " + rows[rows.length - 1].join(" "));
+    const row = [b.bench, ...cells, fmt_secs(c.secs), fmt_secs(ts)];
+    if (LEAN) {
+      await exec_run([b.lbin], dir, RUN_TIMEOUT);
+      row.push(fmt_secs(runtime_check(b, "main.lean", await exec_run([b.lbin],
+        dir, RUN_TIMEOUT)).secs));
+    }
+    put(row);
+    say("runtime " + row.join(" "));
   }
   fs.rmSync(dir, { recursive: true, force: true });
-  return rows;
 }
 
 // Checker
@@ -348,21 +418,52 @@ async function checker_rows(keep: string[]): Promise<string[][]> {
 // Main
 // ====
 
-const args = process.argv.slice(2);
-const keep = args.flatMap((a, i) => args[i - 1] === "--keep" ? [a] : []);
+const args = ARGS;
+const opt = (o: string): string[] =>
+  args.flatMap((a, i) => args[i - 1] === o ? [a] : []);
+const keep = opt("--keep");
 const known = ["runtime", "checker"];
-if (args.some((a, i) => !known.includes(a) && a !== "--keep"
-  && args[i - 1] !== "--keep")) {
+const flags = ["--keep", "--only", "--col", "--gpu-span", "--note"];
+if (args.some((a, i) => !known.includes(a) && ![...flags, "--no-lean"]
+  .includes(a) && !flags.includes(args[i - 1]))) {
   process.stderr.write("usage: bun bend2/docs/gen_pins.ts [runtime]"
-    + " [checker] [--keep <lang>]\n");
+    + " [checker] [--keep <lang>] [--no-lean] [--only <bench>] [--col <mode>]"
+    + " [--gpu-span <bench>=<span>] [--note <text>]\n");
   process.exit(1);
 }
 say("pins for " + HW);
 const targets = known.filter((k) => args.includes(k));
 for (const target of targets.length === 0 ? known : targets) {
   if (target === "runtime") {
-    pin_write(path.join(RUNTIME, "_pin_", HW + ".txt"), "Runtime", target,
-      pin_table(["bench", ...MODES, "C", "TS", "Lean"], await runtime_rows()));
+    const file = path.join(RUNTIME, "_pin_", HW + ".txt");
+    const only = opt("--only");
+    const col = opt("--col");
+    const modes = col.map((c) => MODES.indexOf(c));
+    if (modes.includes(-1)) {
+      throw new Error("--col takes one of " + MODES.join(", "));
+    }
+    const merge = only.length > 0 || col.length > 0;
+    const rows = merge && fs.existsSync(file) ? pin_rows(file)[1]
+      : new Map<string, string[]>();
+    // --col keeps the stamps before it, but a stamp of its own column's
+    const prior = col.length === 0 || !fs.existsSync(file) ? [] : fs
+      .readFileSync(file, "utf8").split("\n").filter((l) => /^# \d{4}-/.test(l)
+      && !col.some((c) => l.includes(" --col " + c)));
+    const how = [...col.map((c) => " --col " + c),
+      ...args.includes("--no-lean") ? [" --no-lean"] : [],
+      ...LINUX ? ["; every column built by " + TWIN.split(" ")[0]
+      + ", PAR-GPU on the HIP lane"] : [],
+      ...opt("--gpu-span").map((s) => "; --gpu-span " + s),
+      ...opt("--note").map((s) => "; " + s)].join("");
+    await runtime_rows(only, modes, (row) => {
+      const was = rows.get(row[0]) ?? [];
+      rows.set(row[0], Array.from({ length: Math.max(was.length,
+        row.length - 1) }, (_, i) => row[i + 1] || (was[i] ?? "-").padStart(i < 3 ? 15 : 8)));
+      pin_write(file, "Runtime", target, pin_table(["bench", ...MODES, "C",
+        "TS", ...LEAN ? ["Lean"] : []], [...rows].sort().map(([b, c]) =>
+        [b, ...c])), how + (GPU_DOWN.length === 0 ? "" : "; PAR-GPU failed"
+        + " twice, pinned -: " + GPU_DOWN.join(", ")), prior);
+    });
   } else {
     const file = path.join(CHECKER, "_pin_", HW + ".txt");
     const kept = keep.length === 0 ? "" : "; " + keep.join(", ")
