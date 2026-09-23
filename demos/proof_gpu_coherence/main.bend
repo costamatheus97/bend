@@ -28,9 +28,9 @@ type Pr is Data:
   PR{}
   PW{}
 
-# gpu_fault_lock's section on a chunk: a stale chunk copied into the
-# alias (SCp), then opened (SOp); a fetched chunk opened (FOp); each
-# before its state store. wr: the fault was a write
+# a chunk's lock section (the C's gpu_lock[c]): a stale chunk copied
+# into the alias (SCp), then opened (SOp); a fetched chunk opened
+# (FOp); each before its state store. wr: the fault was a write
 type Lk is Data:
   Free{}
   SCp{wr: Bool}

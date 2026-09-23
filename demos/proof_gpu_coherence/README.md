@@ -42,8 +42,7 @@ No liveness: a fault that never opens its chunk keeps them all.
 
 Chunk runs and the GAP merge; the memfd layout; timing counters; the
 device running beside the host (turns are exclusive); weak memory (the
-model is sequentially consistent); the global fault lock (a per-chunk
-lock over-approximates it); a trap and its first state load as two
+model is sequentially consistent); a trap and its first state load as two
 steps (merged: the diff test runs the C's late loads); `wr == 2`;
 mprotect and hipMemcpy failures; `gpu_show`'s upload. The laws hold for
 any prefetch set.
