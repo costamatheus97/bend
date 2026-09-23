@@ -5456,10 +5456,12 @@ static u64  gpu_turns, gpu_faults, gpu_dev_ns;
 static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
 static u64  gpu_calls[5][2], gpu_bytes[5][2], gpu_ns[5][2];
 // gpu_alias's registered pieces (gpu_pin): their ends, ascending, from
-// gpu_lo; gpu_pin_hi the last, 0 with none. BEND_GPU_PIN=0: gpu_nopin
-#define GPU_PIN_GRAIN (32ull << 20)
+// gpu_lo; gpu_pin_hi the last, 0 with none. gpu_paged: the tracked bytes
+// copied pageable since the last piece. BEND_GPU_PIN=0: gpu_nopin
+#define GPU_PIN_GRAIN   (32ull << 20)
+#define GPU_PIN_PAYBACK 4
 static u64* gpu_pins;
-static u64  gpu_npin, gpu_pin_hi, gpu_pin_ns;
+static u64  gpu_npin, gpu_pin_hi, gpu_pin_ns, gpu_paged;
 static bool gpu_nopin;
 static u64  io_tick(void);
 
@@ -5503,8 +5505,10 @@ static void gpu_stats(void) {
     }
   }
   fprintf(stderr, "bend: hip   pin %llu MB registered in %llu pieces, %llu"
-    " ms\n", (unsigned long long)(gpu_npin ? (gpu_pin_hi - gpu_lo) >> 20 : 0),
-    (unsigned long long)gpu_npin, (unsigned long long)(gpu_pin_ns / 1000000));
+    " ms; %llu MB pageable since\n",
+    (unsigned long long)(gpu_npin ? (gpu_pin_hi - gpu_lo) >> 20 : 0),
+    (unsigned long long)gpu_npin, (unsigned long long)(gpu_pin_ns / 1000000),
+    (unsigned long long)(gpu_paged >> 20));
   for (GpuKey* k = gpu_keys; k < gpu_keys + GPU_KEYS && k->hist; k += 1) {
     fprintf(stderr, "bend: hip   key %u: %llu demand (%llu in history), %llu"
       " used, %llu unused, %llu fetched in %llu runs, leave %llu us (copies"
@@ -5634,6 +5638,9 @@ static bool gpu_move(u64 a, u64 b, bool up, bool al) {
     }
     char* h = al || (a >= gpu_lo && a < gpu_pin_hi) ? gpu_alias
       : (char*)CORPUS;
+    if (a >= gpu_pin_hi && a >= gpu_lo && a < gpu_hi) {
+      GPU_ADD(gpu_paged, e - a);
+    }
     if (hipMemcpy(up ? (char*)gpu_vram + a : h + a,
       up ? h + a : (char*)gpu_vram + a, e - a,
       up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) != hipSuccess) {
@@ -5836,20 +5843,26 @@ static void gpu_k(u64 c, u64 to, bool k1, bool host) {
   }
 }
 
-// Registered (pinned), the alias's copies run at ~20 GB/s, not ~4, but
-// registering makes the bytes resident, ~1 s a GB. So only what the heap
-// reaches: each gpu_heap grows the registered prefix of the tracked bytes
-// to cover to, as a new piece of at least a quarter of what is registered
-// (few pieces), rounded up to GPU_PIN_GRAIN (little waste). Edges fall on
-// chunks, so a fault's copy crosses none. Past half of MemAvailable (with
-// what is registered), or a failed registration: it stops with a warning,
-// and what lies above stays pageable. BEND_GPU_PIN=0: none at all.
+// Registered (pinned), the alias's copies run at ~20 GB/s, not ~4 (a
+// saving of ~0.2 ms a MB), but registering costs ~0.6 to 0.9 ms a MB and
+// makes the bytes resident: it pays only for bytes that cross several
+// times. So a rent-or-buy rule: each gpu_heap grows the registered prefix
+// of the tracked bytes to cover to, as a new piece, once the tracked
+// bytes copied pageable since the last piece reach GPU_PIN_PAYBACK times
+// its size (a one-turn program never pays; one that comes back pays at
+// most about twice what knowing the future would). A piece is at least a
+// quarter of what is registered (few pieces), rounded up to GPU_PIN_GRAIN
+// (little waste). Edges fall on chunks, so a fault's copy crosses none.
+// Past half of MemAvailable (with what is registered), or a failed
+// registration: it stops with a warning, and what lies above stays
+// pageable. BEND_GPU_PIN=0: none at all.
 static void gpu_pin(u64 to) {
   u64 at = gpu_npin != 0 ? gpu_pin_hi : gpu_lo;
   u64 hi = to > at + (at - gpu_lo) / 4 ? to : at + (at - gpu_lo) / 4;
   hi = gpu_lo + ((hi - gpu_lo + GPU_PIN_GRAIN - 1) & ~(GPU_PIN_GRAIN - 1));
   hi = hi < gpu_hi ? hi : gpu_hi;
-  if (gpu_nopin || to <= at || hi <= at) {
+  if (gpu_nopin || to <= at || hi <= at
+    || gpu_paged < GPU_PIN_PAYBACK * (hi - at)) {
     return;
   }
   char    mi[512] = { 0 };
@@ -5878,6 +5891,7 @@ static void gpu_pin(u64 to) {
   gpu_pins[gpu_npin++] = hi;
   gpu_pin_hi  = hi;
   gpu_pin_ns += io_tick() - t0;
+  gpu_paged   = 0;
 }
 
 // The static image and the heap up to the word end. The tracked chunks are
@@ -6039,6 +6053,9 @@ static bool gpu_fault(void* addr, u32 wr) {
     if (s == GPU_STALE) {
       u64 t0 = gpu_stat ? io_tick() : 0;
       u8  to = wr == 1 ? GPU_DIRTY : GPU_CLEAN;
+      if (at >= gpu_pin_hi) {
+        GPU_ADD(gpu_paged, GPU_CHUNK);
+      }
       ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
         hipMemcpyDeviceToHost) == hipSuccess
         && mprotect((char*)CORPUS + at, GPU_CHUNK,
