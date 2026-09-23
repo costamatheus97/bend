@@ -5455,6 +5455,7 @@ static u32  gpu_part;
 static u64  gpu_turns, gpu_faults, gpu_dev_ns;
 static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
 static u64  gpu_calls[5][2], gpu_bytes[5][2], gpu_ns[5][2];
+static u64  gpu_pin_lo, gpu_pin_hi;  // gpu_alias's registered bytes, or none
 static u64  io_tick(void);
 
 // atomic: faults on different chunks tally at once
@@ -5607,13 +5608,21 @@ static void gpu_load(u64 bytes) {
   }
 }
 
+// Inside the registered bytes the host side is gpu_alias: it never traps,
+// and an upload spans no stale or fetched chunk (gpu_heap). A copy across
+// the registration's edge would fail, so none may.
 static void gpu_copy(u64 lo, u64 hi, bool up) {
   if (hi <= lo) {
     return;
   }
-  u64 t0 = gpu_stat ? io_tick() : 0;
-  if (hipMemcpy(up ? (void*)(gpu_vram + lo) : (void*)(CORPUS + lo),
-    up ? (void*)(CORPUS + lo) : (void*)(gpu_vram + lo), (hi - lo) * 8,
+  u64   t0 = gpu_stat ? io_tick() : 0;
+  bool  in = lo * 8 >= gpu_pin_lo && hi * 8 <= gpu_pin_hi;
+  char* h  = (in ? gpu_alias : (char*)CORPUS) + lo * 8;
+  if (!in && lo * 8 < gpu_pin_hi && hi * 8 > gpu_pin_lo) {
+    err_fail("a corpus copy straddles the registered range");
+  }
+  if (hipMemcpy(up ? (void*)(gpu_vram + lo) : (void*)h,
+    up ? (void*)h : (void*)(gpu_vram + lo), (hi - lo) * 8,
     up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) != hipSuccess) {
     err_fail("corpus copy failed");
   }
@@ -5828,6 +5837,39 @@ static void gpu_heap(u64 end, u32 way) {
       || hipMemset((char*)gpu_vram + m, 0, TWIN_MAPW(corpus_size / 8) * 8)
       != hipSuccess) {
       err_fail("corpus reservation failed");
+    }
+    // Registered (pinned), the alias's copies of the tracked bytes run at
+    // ~20 GB/s, not ~4; registering makes them resident, ~1 s a GB. Not
+    // with BEND_GPU_PIN=0, nor over half of MemAvailable: then pageable.
+    const char* pin = getenv("BEND_GPU_PIN");
+    if (gpu_hi > gpu_lo && (pin == NULL || atoi(pin) != 0)) {
+      char    mi[512] = { 0 };
+      int     fd = open("/proc/meminfo", O_RDONLY);
+      ssize_t r  = fd < 0 ? -1 : read(fd, mi, sizeof mi - 1);
+      char*   av = r > 0 ? strstr(mi, "MemAvailable:") : NULL;
+      u64     kb = av == NULL ? 0 : strtoull(av + 13, NULL, 10);
+      u64     t0 = io_tick();
+      bool    big = (gpu_hi - gpu_lo) >> 10 > kb / 2;
+      if (fd >= 0) {
+        close(fd);
+      }
+      if (big || hipHostRegister(gpu_alias + gpu_lo, gpu_hi - gpu_lo,
+        hipHostRegisterDefault) != hipSuccess) {
+        fprintf(stderr, "bend: hip pin %s: %llu MB tracked, %llu MB"
+          " available; copies stay pageable\n", big ? "skipped" : "failed",
+          (unsigned long long)((gpu_hi - gpu_lo) >> 20),
+          (unsigned long long)(kb >> 10));
+      } else if (hipDeviceSynchronize() != hipSuccess) {
+        err_fail("device fault");
+      } else {
+        gpu_pin_lo = gpu_lo;
+        gpu_pin_hi = gpu_hi;
+        if (gpu_stat) {
+          fprintf(stderr, "bend: hip pin %llu MB registered in %llu ms\n",
+            (unsigned long long)((gpu_hi - gpu_lo) >> 20),
+            (unsigned long long)((io_tick() - t0) / 1000000));
+        }
+      }
     }
   }
   u64 e  = end * 8;
