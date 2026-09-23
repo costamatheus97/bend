@@ -326,7 +326,7 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
     and: "(o & $2) >>> 0", or: "(o | $2) >>> 0", xor: "(o ^ $2) >>> 0",
     exch: "$2", cmpx: "o === $2 ? $3 : o", fadd: "Math.fround(o + $2)",
   }).map(([k, js]) => ["array_atomic_" + k.replace("cmpx", "cas"), {
-    C:    ["$0", "a32_" + k + "(blk_ptr(e.mem, blk_loc(e.mem, $0),"
+    C:    ["$0", "a32_" + k + "(blk_wptr(e.mem, blk_loc(e.mem, $0),"
       + " blk_at($0, $1, 0)), (u32)$2" + (k === "cmpx" ? ", (u32)$3)" : ")")],
     call: true,
     JS:   "array_rmw($0, $1, (o) => " + js + ")",
@@ -1126,8 +1126,10 @@ function ctr_build(fl: File, k: Bend.Name, exprs: string[],
   const at = fl.spares.findIndex((s) =>
     cls_fit(s.words) === cls_fit(exprs.length));
   const s = at < 0 ? null : fl.spares.splice(at, 1)[0];
+  // a spare is old memory: twin_re marks it (row 11 of the design's table)
+  const re = s && `twin_re(e, ${s.name}, ${exprs.length})`;
   const got = s === null ? alloc
-    : s.z ? `${s.name} >= HEAP_OFF ? ${s.name} : ${alloc}` : s.name;
+    : s.z ? `${s.name} >= HEAP_OFF ? ${re} : ${alloc}` : re;
   return `term_ctr(${cid}, ${node_fill(fl, "nd", got, exprs,
     fl.hot.has(k))})`;
 }
@@ -1671,6 +1673,9 @@ function seg_open(fl: File, name: string, ret: Lay, frame: Seg["frame"],
 // Node
 // ====
 
+// A store into old memory (a spare, ctr_build) goes through twin_re, a
+// runtime one through twin_mark: HIP's leave keeps what the device did
+// not mark (OPTIONS-DESIGN.md §2.2)
 function node_fill(fl: File, k: string, alloc: string,
   exprs: string[], shr = false): string {
   const nd = name_local(fl, k);
@@ -3473,6 +3478,15 @@ using namespace metal;
 #endif
 #define FAR static __attribute__((noinline))
 
+// HIP's corpus has a twin in VRAM (gpu_vram): the device marks the chunks
+// of it that it writes below the host's frozen bump, for the leave. From
+// the source, so the device's text and the hiprtc options stay one
+#if defined(__HIPCC_RTC__) || (BEND_HIP && !DEVICE)
+#define BEND_TWIN 1
+#else
+#define BEND_TWIN 0
+#endif
+
 // A segment: a case of the device's switch; on the host, a preserve_none
 // function (WL_SIG) left by a musttail call, its words fresh at WL_OPEN.
 #if DEVICE
@@ -3639,6 +3653,8 @@ typedef u32* Cur;
 
 #define H_BUMP       0
 #define H_CAP        1
+#define H_TWIN_HI    2  // BEND_TWIN: the enter's bump as a Loc
+#define H_TWIN_MAP   3  // BEND_TWIN: the write map's Loc, a u32 a chunk
 #define H_CURSOR     LINE
 #define H_ROOT_DONE  (2 * LINE)
 #define H_ERROR_CODE (3 * LINE)
@@ -3909,6 +3925,36 @@ INLINE void bank_push(Corpus H, Cls c, Loc head) {
   UNLOCK(bank_lock);
 }
 
+// Twin
+// ====
+
+// BEND_TWIN: a device store below H_TWIN_HI marks its chunk (2^TWIN_LOG
+// words, GPU_CHUNK bytes) in the map, a u32 an absolute chunk (loc >>
+// TWIN_LOG), for the leave. A new runtime or emitted store into old
+// memory needs a mark (OPTIONS-DESIGN.md §2.2): BEND_GPU_CHECK=1 finds an
+// unmarked one. Elsewhere a mark is nothing.
+#define TWIN_LOG 15
+#define TWIN_MAPW(span) (((span) >> (TWIN_LOG + 1)) + 1)  // words
+#if BEND_TWIN && DEVICE
+INLINE void twin_mark(Corpus H, Loc loc, u64 n) {
+  if (loc < H[H_TWIN_HI] && n != 0) {
+    DEV u32* m = (DEV u32*)(H + H[H_TWIN_MAP]);
+    for (u64 c = loc >> TWIN_LOG; c <= (loc + n - 1) >> TWIN_LOG; c += 1) {
+      a32_or(m + c, 1);
+    }
+  }
+}
+
+// the emitter's refill of a spare slot in place: n words from loc
+INLINE Loc twin_re(Env e, Loc loc, u64 n) {
+  twin_mark(e.mem, loc, n);
+  return loc;
+}
+#else
+#define twin_mark(H, loc, n)
+#define twin_re(e, loc, n) (loc)
+#endif
+
 // Heap
 // ====
 
@@ -3976,6 +4022,7 @@ OUTLINE Loc heap_alloc_miss(Env e, Cls cls) {
   }
   ALC_AT(e, cls)  = H[got];
   ALC_LEN(e, cls) = (u64)(n - 1) << cls;
+  twin_mark(H, got, 1ull << cls);
   return got;
 }
 
@@ -3984,6 +4031,7 @@ INLINE Loc heap_alloc(Env e, Cls cls) {
   if (h) {
     ALC_AT(e, cls)   = e.mem[h];
     ALC_LEN(e, cls) -= 1ull << cls;
+    twin_mark(e.mem, h, 1ull << cls);
     return h;
   }
   return heap_alloc_miss(e, cls);
@@ -3993,6 +4041,7 @@ INLINE void heap_free(Env e, Cls cls, Loc loc) {
   if (err_seen(e.mem)) {
     return;
   }
+  twin_mark(e.mem, loc, 1);
   e.mem[loc]       = ALC_AT(e, cls);
   ALC_AT(e, cls)   = loc;
   ALC_LEN(e, cls) += 1ull << cls;
@@ -4075,6 +4124,7 @@ INLINE u64 rfc_view(Env e, Loc r) {
 
 INLINE void rfc_bump(Env e, Loc r, u32 k) {
   u32 c = a32_add(a32_at(e.mem, r), k);
+  twin_mark(e.mem, r, 1);
   if ((c & RFC_CNT) >= RFC_CNT - k) {
     err_post(e.mem, ERR_RFCS);
   }
@@ -4127,6 +4177,7 @@ FAR void term_drop(Env e, Term t) {
       Loc      r = term_loc(t);
       DEV u32* p = a32_at(H, r);
       if ((a32_sub_rel(p, 1) & RFC_CNT) != 1) {
+        twin_mark(H, r, 1);
         t = 0;
       } else {
         a32_acq(p);
@@ -4286,12 +4337,25 @@ INLINE Term blk_read(Corpus H, bool arr, Loc loc, u32 i) {
   return (u64)*blk_ptr(H, loc, i);
 }
 
-INLINE void blk_write(Corpus H, bool arr, Loc loc, u32 i, Term v) {
+// a u32 i (word loc + i / 2) of a block that may be old memory: marked
+INLINE DEV u32a* blk_wptr(Corpus H, Loc loc, u32 i) {
+  twin_mark(H, loc + (i >> 1), 1);
+  return blk_ptr(H, loc, i);
+}
+
+INLINE void blk_put(Corpus H, bool arr, Loc loc, u32 i, Term v) {
   if (arr) {
     H[loc + i] = v;
   } else {
     *blk_ptr(H, loc, i) = (u32)v;
   }
+}
+
+// array_set and swap: an owned block, maybe old memory (a new writing
+// intrinsic needs a mark too, see Twin)
+INLINE void blk_write(Corpus H, bool arr, Loc loc, u32 i, Term v) {
+  twin_mark(H, loc + (arr ? i : i >> 1), 1);
+  blk_put(H, arr, loc, i, v);
 }
 
 INLINE u32 blk_at(Term a, U32 i, u32 lgs) {
@@ -4302,6 +4366,7 @@ INLINE Term blk_keep(Env e, Loc at) {
   Term w = e.mem[at];
   Term v = term_keep(e, w);
   if (v != w) {
+    twin_mark(e.mem, at, 1);
     e.mem[at] = v;
   }
   return v;
@@ -4393,7 +4458,7 @@ INLINE Term blk_new(Env e, bool arr, Nat d, u32 lgs, u32 n, THR Term* v) {
     v[j] = w;
   }
   for (u64 i = 0; i < (1ull << c); i += 1) {
-    blk_write(H, arr, l, (u32)i, i % (1u << lgs) < n ? v[i % (1u << lgs)] : 0);
+    blk_put(H, arr, l, (u32)i, i % (1u << lgs) < n ? v[i % (1u << lgs)] : 0);
   }
   return term_blk(arr, c, l);
 }
@@ -4458,6 +4523,8 @@ INLINE Term task_deliver(Corpus H, Term cont, u32 idx, THR Term* v, u32 n) {
     return 0;
   }
   Loc tl = task_tail(cont);
+  twin_mark(H, at, n < WL_RESW ? n : WL_RESW);
+  twin_mark(H, tl + 1, 1);
   if (a32_sub_rel(a32_at(H, tl + 1), 1) == 1) {
     a32_acq(a32_at(H, tl + 1));
     return cont;
@@ -4476,6 +4543,7 @@ INLINE void task_deal(Corpus H, Term join, u32 base, u32 stride, Cur cur) {
   for (u32 i = 0; i < ar; i += 1) {
     Term k = H[loc + i];
     if (term_tag(k) == TAG_TSK) {
+      twin_mark(H, loc + i, 1);
       H[loc + i] = TERM_HOLE;
       Ring to;
       if (stride != 0) {
@@ -4700,6 +4768,7 @@ INLINE void dev_cut(Env e) {
       }
       ALC_AT(e, c)    = e.mem[tail];
       ALC_LEN(e, c)  -= gen;
+      twin_mark(e.mem, tail, 1);
       e.mem[tail]     = 0;
       bank_push(e.mem, c, head);
     }
@@ -5361,6 +5430,16 @@ typedef struct {
 } GpuKey;
 static GpuKey  gpu_keys[GPU_KEYS];  // the least recently left goes first
 static GpuKey* gpu_at;              // the key whose leave opened the interval
+// The enter's H_TWIN_HI, a Loc, and in bytes clamped to [gpu_lo, gpu_hi]:
+// its chunk, the ceiling, rounded down (a device page may share it), and
+// every chunk above are the device's; below, the leave reads the marks
+static u64   gpu_twhi, gpu_ceil;
+static u32*  gpu_mk;    // the leave's copy of the map, a tracked chunk each
+static bool  gpu_check; // BEND_GPU_CHECK=1: K0, K1, K2 (see gpu_k)
+static char* gpu_snap;  // the check's copy of [gpu_lo, gpu_twhi) at the enter
+static u64   corpus_size;  // the Corpus section's (a tentative definition)
+static u64   gpu_snap_cap;
+_Static_assert(GPU_CHUNK == 8ull << TWIN_LOG, "a map chunk is a GPU_CHUNK");
 
 // BEND_GPU_STATS=1: at exit, what the turns cost, by region and way
 static bool gpu_stat;
@@ -5516,6 +5595,8 @@ static void gpu_load(u64 bytes) {
   const char* pf = getenv("BEND_GPU_PREFETCH");
   gpu_pf   = pf == NULL ? 0 : (u32)atoi(pf);
   gpu_stat = getenv("BEND_GPU_STATS") != NULL;
+  gpu_check = getenv("BEND_GPU_CHECK") != NULL
+    && strcmp(getenv("BEND_GPU_CHECK"), "0") != 0;
   if (gpu_stat) {
     atexit(gpu_stats);
   }
@@ -5643,10 +5724,48 @@ static void gpu_publish(void) {
   }
 }
 
+// BEND_GPU_CHECK=1 (OPTIONS-DESIGN.md §2.3), tracked chunk c below byte
+// to: K0, after the enter's uploads, a chunk not stale holds the device's
+// bytes; at the leave, before it invalidates, K1, an unmarked chunk under
+// H_TWIN_HI holds what it held at the enter (the snapshot: the device
+// wrote only what it marked), and K2, an unmarked one under the ceiling,
+// not stale, holds the host's bytes (read through gpu_alias)
+static void gpu_k(u64 c, u64 to, bool k1, bool host) {
+  static u64 *d, *x;
+  u64 at  = gpu_lo + c * GPU_CHUNK;
+  u64 len = to - at < GPU_CHUNK ? to - at : GPU_CHUNK;
+  if ((d == NULL && (d = malloc(GPU_CHUNK)) == NULL)
+    || (x == NULL && (x = malloc(GPU_CHUNK)) == NULL)
+    || hipMemcpy(d, (char*)gpu_vram + at, len, hipMemcpyDeviceToHost)
+    || (k1 && hipMemcpy(x, gpu_snap + (at - gpu_lo), len,
+      hipMemcpyDeviceToHost))) {
+    err_fail("the GPU check's copy failed");
+  }
+  for (u32 k = 0; k < 2; k += 1) {
+    const u64* r = k == 0 ? (k1 ? x : NULL)
+      : host ? (const u64*)(gpu_alias + at) : NULL;
+    for (u64 w = 0; r != NULL && w < len / 8; w += 1) {
+      if (d[w] != r[w]) {
+        fprintf(stderr, "bend: GPU check %s: word %llu (chunk %llu, state"
+          " %u%s) is %016llx (tag %u) on the device, %016llx (tag %u) %s\n",
+          k == 0 ? "K1" : k1 ? "K2" : "K0", (unsigned long long)(at / 8 + w),
+          (unsigned long long)c, gpu_state[c], k1 ? ", unmarked" : "",
+          (unsigned long long)d[w], (u32)(d[w] >> 56),
+          (unsigned long long)r[w], (u32)(r[w] >> 56),
+          k == 0 ? "at the enter" : "on the host");
+        err_fail("GPU check failed");
+      }
+    }
+  }
+}
+
 // The static image and the heap up to the word end. The tracked chunks are
 // the whole ones within the heap; what lies outside them goes eagerly.
-static void gpu_heap(u64 end, bool up) {
-  Corpus H = CORPUS;
+// way: 0 a leave, 1 an enter, 2 gpu_show's upload
+static void gpu_heap(u64 end, u32 way) {
+  Corpus H  = CORPUS;
+  bool   up = way != 0;
+  u64    m  = H[H_TWIN_MAP] * 8;
   if (gpu_state == NULL) {
     u64 cap = a32_load(a32_at(H, H_CAP));
     gpu_lo = (HEAP_OFF * 8 + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
@@ -5656,7 +5775,12 @@ static void gpu_heap(u64 end, bool up) {
     gpu_state = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
     gpu_lock  = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 4);
     gpu_cur   = calloc(gpu_words, 8);
-    if (gpu_state == NULL || gpu_lock == NULL || gpu_cur == NULL) {
+    gpu_mk    = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 4);
+    // the twin's map is zero from here: gpu_map zeroes only below STAK_OFF
+    if (gpu_state == NULL || gpu_lock == NULL || gpu_cur == NULL
+      || gpu_mk == NULL || gpu_hi / GPU_CHUNK > 2 * TWIN_MAPW(corpus_size / 8)
+      || hipMemset((char*)gpu_vram + m, 0, TWIN_MAPW(corpus_size / 8) * 8)
+      != hipSuccess) {
       err_fail("corpus reservation failed");
     }
   }
@@ -5668,6 +5792,11 @@ static void gpu_heap(u64 end, bool up) {
     gpu_copy(gpu_hi / 8, end, up);
   }
   u64 n = (te - gpu_lo) / GPU_CHUNK;
+  if (way == 1) {
+    u64 tw = H[H_TWIN_HI] * 8;
+    gpu_twhi = tw < gpu_lo ? gpu_lo : tw > gpu_hi ? gpu_hi : tw;
+    gpu_ceil = (gpu_twhi - gpu_lo) / GPU_CHUNK;
+  }
   for (u64 c = 0; up && c < n;) {
     while (c < n && gpu_state[c] != GPU_DIRTY) {
       c += 1;
@@ -5681,13 +5810,45 @@ static void gpu_heap(u64 end, bool up) {
     gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + hi * GPU_CHUNK) / 8, up);
     c = hi;
   }
+  if (way == 1 && gpu_check) {
+    for (u64 c = 0; c < n; c += 1) {
+      if (gpu_state[c] != GPU_STALE) {
+        gpu_k(c, gpu_hi, false, true);
+      }
+    }
+    u64 len = gpu_twhi - gpu_lo;
+    if (len > gpu_snap_cap && (hipFree(gpu_snap) != hipSuccess
+      || hipMalloc((void**)&gpu_snap, len) != hipSuccess)) {
+      err_fail("the GPU check's snapshot does not fit in device memory");
+    }
+    gpu_snap_cap = len > gpu_snap_cap ? len : gpu_snap_cap;
+    if (hipMemcpy(gpu_snap, (char*)gpu_vram + gpu_lo, len,
+      hipMemcpyDeviceToDevice) != hipSuccess) {
+      err_fail("the GPU check's copy failed");
+    }
+  }
   // Plain stores, no lock: no host thread runs during a turn (see gpu_fault)
   if (!up) {
+    // the marks of the tracked chunks, by absolute chunk in the map
+    if (n != 0 && hipMemcpy(gpu_mk, (char*)gpu_vram + m
+      + gpu_lo / GPU_CHUNK * 4, n * 4, hipMemcpyDeviceToHost) != hipSuccess) {
+      err_fail("corpus copy failed");
+    }
+    for (u64 c = 0; gpu_check && gpu_lo + c * GPU_CHUNK < gpu_twhi; c += 1) {
+      if (!gpu_mk[c]) {
+        gpu_k(c, gpu_twhi, true, c < gpu_ceil && gpu_state[c] != GPU_STALE);
+      }
+    }
     if (n != 0 && mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
       err_fail("corpus protection failed");
     }
     memset(gpu_state, GPU_STALE, n);
     gpu_fetch(n);
+    // the whole map (4 bytes a chunk): a mark may run past H_TWIN_HI
+    if (hipMemset((char*)gpu_vram + m, 0, TWIN_MAPW(corpus_size / 8) * 8)
+      != hipSuccess) {
+      err_fail("corpus copy failed");
+    }
   }
 }
 
@@ -5773,6 +5934,7 @@ static void gpu_sync(bool up) {
   gpu_turns += up;
   if (up) {
     gpu_publish();
+    H[H_TWIN_HI] = HEAP_OFF + ((u64)a32_load(a32_at(H, H_BUMP)) << PAGE_BITS);
   }
   gpu_part = 0;
   gpu_copy(0, ALC_OFF, up);
@@ -5844,7 +6006,7 @@ static void gpu_show(Term image, u32 w, u32 h, u32 k, u32* pix) {
   u64 sent = gpu_sent;  // a frame's chunks are not a turn's
   gpu_part = 2;
   gpu_heap(HEAP_OFF
-    + (((u64)a32_load(a32_at(CORPUS, H_BUMP)) + 1) << PAGE_BITS), true);
+    + (((u64)a32_load(a32_at(CORPUS, H_BUMP)) + 1) << PAGE_BITS), 2);
   gpu_part = 0;
   gpu_sent = sent;
   args.mem  = gpu_vram;
@@ -5933,9 +6095,12 @@ static void* corpus_map(u64 size) {
   return p;
 }
 
+// BEND_TWIN: the write map (a u32 a chunk of the span) past the banks
 static void corpus_lay(Corpus H, u64 size) {
   u64 span = size / 8;
-  u64 cap  = span > HEAP_OFF ? (span - HEAP_OFF) / (PAGE_LEN + 10) : 0;
+  u64 mw   = BEND_TWIN ? TWIN_MAPW(span) : 0;
+  u64 cap  = span > HEAP_OFF + mw ? (span - HEAP_OFF - mw) / (PAGE_LEN + 10)
+    : 0;
   if (cap <= CUBE) {
     err_fail("the GPU span is under the rings, stacks and a page per lane");
   }
@@ -5946,6 +6111,12 @@ static void corpus_lay(Corpus H, u64 size) {
     memcpy(H + at, H + b->off, b->wr * sizeof(u64));
     b->off  = at;
     at     += 2 * (cap >> ((c < NCLS ? NCLS : c) - PAGE_BITS));
+  }
+  if (at + mw > span) {
+    err_fail("the corpus layout overflows its span");
+  }
+  if (BEND_TWIN) {
+    H[H_TWIN_MAP] = at;  // fresh pages: zero (the twin's: gpu_heap)
   }
   corpus_size = size;
   a32_store_rel(a32_at(H, H_CAP), (u32)cap);
