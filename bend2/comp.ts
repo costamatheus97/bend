@@ -5349,7 +5349,7 @@ static bool gpu_probe(void) {
 static u8*   gpu_state;       // a GPU_ state a tracked chunk; calloc is dirty
 static char* gpu_alias;
 static u64   gpu_lo, gpu_hi;  // the tracked bytes of the corpus, whole chunks
-static u32   gpu_fault_lock;
+static u32*  gpu_lock;        // a tracked chunk's lock (see gpu_fault)
 static u32   gpu_pf, gpu_key;   // BEND_GPU_PREFETCH; the entered bang's fid
 static u64   gpu_words;         // a chunk bitmap's u64s
 static u64*  gpu_cur;           // the chunks the host touched since the leave
@@ -5372,10 +5372,12 @@ static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
 static u64  gpu_calls[5][2], gpu_bytes[5][2], gpu_ns[5][2];
 static u64  io_tick(void);
 
+// atomic: faults on different chunks tally at once
+#define GPU_ADD(x, v) __atomic_fetch_add(&(x), (v), __ATOMIC_RELAXED)
 static void gpu_tally(u32 k, bool up, u64 bytes, u64 t0) {
-  gpu_calls[k][up] += 1;
-  gpu_bytes[k][up] += bytes;
-  gpu_ns[k][up]    += io_tick() - t0;
+  GPU_ADD(gpu_calls[k][up], 1);
+  GPU_ADD(gpu_bytes[k][up], bytes);
+  GPU_ADD(gpu_ns[k][up], io_tick() - t0);
 }
 
 // the fetched chunks nobody touched: at an enter or at exit, unused
@@ -5559,7 +5561,7 @@ static void gpu_rings(bool up) {
   }
 }
 
-// At a leave, under gpu_fault_lock, every chunk under n stale: the key's
+// At a leave, every chunk under n stale: the key's
 // slot (a new key takes the least recently left, empty), then its history
 // under n comes down in runs, fetched.
 static void gpu_fetch(u64 n) {
@@ -5603,16 +5605,28 @@ static void gpu_fetch(u64 n) {
   k->copy_ns += gpu_ns[4][0] - ns;
 }
 
-// Under gpu_fault_lock: the host touched chunk c, fetched (used) or not
+// A chunk's lock: a waiter spins on a load, with a pause, not on the swap
+static void gpu_hold(u32* l) {
+  while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) {
+    while (__atomic_load_n(l, __ATOMIC_RELAXED)) {
+#ifdef __x86_64__
+      __builtin_ia32_pause();
+#endif
+    }
+  }
+}
+
+// Under chunk c's lock: the host touched it, fetched (used) or not. The
+// bitmap and counts are shared: atomic (gpu_at, its history: no thread)
 static void gpu_touch(u64 c, bool used, u64 t0) {
   if (gpu_at != NULL) {
-    gpu_cur[c >> 6] |= 1ull << (c & 63);
-    gpu_at->used   += used;
-    gpu_at->demand += !used;
-    gpu_at->hits   += !used && GPU_BIT(gpu_at->hist, c);
+    __atomic_fetch_or(&gpu_cur[c >> 6], 1ull << (c & 63), __ATOMIC_RELAXED);
+    GPU_ADD(gpu_at->used, used);
+    GPU_ADD(gpu_at->demand, !used);
+    GPU_ADD(gpu_at->hits, !used && GPU_BIT(gpu_at->hist, c));
     if (used && gpu_stat) {
       gpu_tally(4, true, 0, t0);
-      gpu_at->touch_ns += io_tick() - t0;
+      GPU_ADD(gpu_at->touch_ns, io_tick() - t0);
     }
   }
 }
@@ -5640,8 +5654,9 @@ static void gpu_heap(u64 end, bool up) {
     gpu_hi = gpu_hi < gpu_lo ? gpu_lo : gpu_hi;
     gpu_words = ((gpu_hi - gpu_lo) / GPU_CHUNK + 64) / 64;
     gpu_state = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
+    gpu_lock  = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 4);
     gpu_cur   = calloc(gpu_words, 8);
-    if (gpu_state == NULL || gpu_cur == NULL) {
+    if (gpu_state == NULL || gpu_lock == NULL || gpu_cur == NULL) {
       err_fail("corpus reservation failed");
     }
   }
@@ -5666,29 +5681,29 @@ static void gpu_heap(u64 end, bool up) {
     gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + hi * GPU_CHUNK) / 8, up);
     c = hi;
   }
-  // Plain stores: no host thread runs during a turn (see gpu_fault)
+  // Plain stores, no lock: no host thread runs during a turn (see gpu_fault)
   if (!up) {
-    LOCK(gpu_fault_lock);
     if (n != 0 && mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
       err_fail("corpus protection failed");
     }
     memset(gpu_state, GPU_STALE, n);
     gpu_fetch(n);
-    UNLOCK(gpu_fault_lock);
   }
 }
 
 // Fetched: as stale, with no copy; the touch counts as used once, as the
-// state leaves fetched once, under the lock.
-// Stale: download under the lock; a write: read-write, dirty; else read
-// only, clean. Clean and a write: read-write, then dirty, with no lock: no
-// bytes move, two writers make the same change, and a download of another
-// chunk would hold them for its copy. Anything else trapped while the
-// chunk was stale and another thread served it. Unlocked, as the leave's
-// stores are, this needs what holds today: no host thread touches the
-// corpus in gpu_enter, gpu_leave or gpu_show, and the uploader sees the
-// flags and bytes through the pool's barrier (pool_done, released in
-// pool_work, acquired in pool_turn). An async turn must restore that.
+// state leaves fetched once. Stale: download; a write: read-write, dirty;
+// else read only, clean. Both under the chunk's lock, held by every move
+// out of fetched or stale, so faults on other chunks do not wait; the
+// section touches no corpus page (the copy goes through gpu_alias), so it
+// cannot fault into a lock it holds. Clean and a write: read-write, then
+// dirty, with no lock: no bytes move, two writers make the same change.
+// Anything else trapped while the chunk was stale and another thread
+// served it. Unlocked, as the leave's stores are, this needs what holds
+// today: no host thread touches the corpus in gpu_enter, gpu_leave or
+// gpu_show, and the uploader sees the flags and bytes through the pool's
+// barrier (pool_done, released in pool_work, acquired in pool_turn). An
+// async turn must restore that.
 static bool gpu_fault(void* addr, u32 wr) {
   u64 off = (u64)((char*)addr - (char*)CORPUS);
   if (gpu_state == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
@@ -5710,7 +5725,7 @@ static bool gpu_fault(void* addr, u32 wr) {
   }
   if (s == GPU_FETCHED) {
     u64 t0 = gpu_stat ? io_tick() : 0;  // the lock's wait counts
-    LOCK(gpu_fault_lock);
+    gpu_hold(&gpu_lock[c]);
     if (__atomic_load_n(st, __ATOMIC_RELAXED) == GPU_FETCHED) {
       ok = mprotect((char*)CORPUS + at, GPU_CHUNK,
         wr == 1 ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
@@ -5720,11 +5735,11 @@ static bool gpu_fault(void* addr, u32 wr) {
         gpu_touch(c, true, t0);
       }
     }
-    UNLOCK(gpu_fault_lock);
+    UNLOCK(gpu_lock[c]);
     return ok;
   }
   if (s == GPU_STALE) {
-    LOCK(gpu_fault_lock);
+    gpu_hold(&gpu_lock[c]);
     s = __atomic_load_n(st, __ATOMIC_RELAXED);
     if (s == GPU_STALE) {
       u64 t0 = gpu_stat ? io_tick() : 0;
@@ -5738,12 +5753,12 @@ static bool gpu_fault(void* addr, u32 wr) {
         gpu_touch(c, false, t0);
       }
       if (gpu_stat) {
-        gpu_faults += 1;
-        gpu_wrote  += wr == 1;
+        GPU_ADD(gpu_faults, 1);
+        GPU_ADD(gpu_wrote, wr == 1);
         gpu_tally(2, false, GPU_CHUNK, t0);
       }
     }
-    UNLOCK(gpu_fault_lock);
+    UNLOCK(gpu_lock[c]);
   }
   if (s != GPU_STALE) {
     __atomic_fetch_add(&gpu_served, 1, __ATOMIC_RELAXED);
