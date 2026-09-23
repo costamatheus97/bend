@@ -7,8 +7,10 @@
 # for an argument word, then the lane's budget; a node's tag and table
 # index are checked before its size is read, and its size against lim
 # before its words; a block over 2^RC_PIECE words goes back as halves; a
-# full stack sends a word to the next round; the rounds stop at their cap,
-# or once the walk's steps pass rall, checked before each dispatch.
+# full stack sends a word to the next round; a dispatch starts only if
+# its lanes' bound, lanes x (budget + RC_SLACK), fits in what is left of
+# rall (else the walk is cut); the rounds stop at a cut, a drained queue
+# or their cap, in that order.
 #
 # Defs come before their callers (Bend's rule), so each chain reads
 # upward. A lane is a machine that makes one C step a fuel: a pop, or
@@ -223,6 +225,7 @@ def Heap.read(heap: Heap, i: Nat, e: LE(1n+i, hl(heap))) -> W:
     case Heap{ws, len, q}:
       rd(W, ws, i, (%q : LE(1n+i, _); e))
 
+# b: RC_WORK over the dispatch's lanes, less the slack a lane may take
 def reach_budget.fin(few: Bool, +b: Nat) -> Nat:
   match few:
     case True{}:
@@ -232,7 +235,7 @@ def reach_budget.fin(few: Bool, +b: Nat) -> Nat:
 
 # reach_budget
 def reach_budget(+nin: Nat) -> Nat:
-  reach_budget.fin(Nat.is_lt(nin, 4096n), Nat.div(rc_work(), min(nin, rc_lanes())))
+  reach_budget.fin(Nat.is_lt(nin, 4096n), Nat.sub(Nat.div(rc_work(), min(nin, rc_lanes())), rc_slack()))
 
 # reach_span
 # ----------
@@ -709,7 +712,8 @@ def S.done(-len: Nat, s: S<len>) -> Bool:
 type Tot is Data:
   Tot{rounds: Nat, steps: Nat, words: Nat, reads: Nat, lanemax: Nat, starved: Nat, over: Nat, why: Nat}
 
-# a round under way: the next dispatch may start (ok), its steps so far
+# a round under way: a dispatch of the lanes left would fit (ok; at the
+# round's end, with none left: none was refused), its steps so far
 type Rd is Data:
   Rd{ok: Bool, rs: Nat, acc: Acc, marks: List<&2, Nat>, seen: List<&2, Nat>, tot: Tot}
 
@@ -720,7 +724,13 @@ def bump(b: Bool, n: Nat) -> Nat:
     case False{}:
       n
 
-def after(+cx: Cx, +all: Nat, rs: Nat, -len: Nat, l: Lane<len>, tot: Tot) -> Rd:
+# a dispatch of n lanes fits: all + the round's steps + n x (budget +
+# RC_SLACK) <= rall
+def fits(+cx: Cx, +budget: Nat, +all: Nat, +rs: Nat, +n: Nat) -> Bool:
+  Nat.is_le(Nat.add(Nat.add(all, rs), Nat.mul(min(n, rc_lanes()), Nat.add(budget, rc_slack()))), Cx.rall(cx))
+
+# after a lane: nq lanes left in the round
+def after(+cx: Cx, +budget: Nat, +all: Nat, +nq: Nat, rs: Nat, -len: Nat, l: Lane<len>, tot: Tot) -> Rd:
   match l:
     case Lane{+s, +c}:
       match s:
@@ -730,14 +740,15 @@ def after(+cx: Cx, +all: Nat, rs: Nat, -len: Nat, l: Lane<len>, tot: Tot) -> Rd:
               match tot:
                 case Tot{rounds, steps, words, reads, lanemax, starved, over, why}:
                   +rs2 = Nat.add(rs, Ctr.steps(c))
-                  Rd{Nat.is_le(Nat.add(all, rs2), Cx.rall(cx)), rs2, acc, marks, seen,
+                  Rd{fits(cx, budget, all, rs2, nq), rs2, acc, marks, seen,
                     Tot{rounds, Nat.add(steps, Ctr.steps(c)), Nat.add(words, Ctr.words(c)),
                       Nat.add(reads, Ctr.reads(c)), max(lanemax, Ctr.steps(c)),
                       bump(Bool.not(S.done(len, s)), starved), over, why}}
 
 # a round's lanes in order, RC_LANES a dispatch; a dispatch starts only
-# while all + the round's steps <= rall (k: lanes left in this one)
-def lanes(+heap: Heap, +cx: Cx, +budget: Nat, +all: Nat, q: List<&2, T>, k: Nat, rd: Rd) -> Rd:
+# if it fits, else the rest of the round is not run (nq: lanes left in
+# the round, k: in this dispatch)
+def lanes(+heap: Heap, +cx: Cx, +budget: Nat, +all: Nat, q: List<&2, T>, +nq: Nat, k: Nat, rd: Rd) -> Rd:
   match q:
     case Nil{}:
       rd
@@ -750,13 +761,13 @@ def lanes(+heap: Heap, +cx: Cx, +budget: Nat, +all: Nat, q: List<&2, T>, k: Nat,
                 case False{}:
                   Rd{False{}, rs, acc, marks, seen, tot}
                 case True{}:
-                  lanes(heap, cx, budget, all, rest, Nat.sub(rc_lanes(), 1n),
-                    after(cx, all, rs, hl(heap), lane(heap, cx, budget, Nat.add(budget, rc_slack()), t, acc, marks, seen), tot))
+                  lanes(heap, cx, budget, all, rest, Nat.sub(nq, 1n), Nat.sub(rc_lanes(), 1n),
+                    after(cx, budget, all, Nat.sub(nq, 1n), rs, hl(heap), lane(heap, cx, budget, Nat.add(budget, rc_slack()), t, acc, marks, seen), tot))
         case 1n+k2:
           match rd:
             case Rd{ok, rs, acc, marks, seen, tot}:
-              lanes(heap, cx, budget, all, rest, k2,
-                after(cx, all, rs, hl(heap), lane(heap, cx, budget, Nat.add(budget, rc_slack()), t, acc, marks, seen), tot))
+              lanes(heap, cx, budget, all, rest, Nat.sub(nq, 1n), k2,
+                after(cx, budget, all, Nat.sub(nq, 1n), rs, hl(heap), lane(heap, cx, budget, Nat.add(budget, rc_slack()), t, acc, marks, seen), tot))
 
 # between rounds: the next queue, its first qcap words in order
 type Pre is Data:
@@ -771,7 +782,7 @@ def post(+cx: Cx, +all: Nat, rd: Rd) -> Pre:
             case Tot{rounds, steps, words, reads, lanemax, starved, over, why}:
               +all2 = Nat.add(all, rs)
               Pre{List.reverse(&2, T, List.drop(&2, T, out, Nat.sub(nout, Cx.qcap(cx)))), min(nout, Cx.qcap(cx)), all2,
-                Nat.is_lt(Cx.rall(cx), all2), Acc{Nil{}, 0n, bad, fbad, split, hits}, marks, seen,
+                Bool.not(ok), Acc{Nil{}, 0n, bad, fbad, split, hits}, marks, seen,
                 Tot{1n+rounds, steps, words, reads, lanemax, starved, bump(Nat.is_lt(Cx.qcap(cx), nout), over), why}}
 
 # the result: totals, bad nodes and the first, splits, argument words
@@ -784,6 +795,8 @@ def finish(why: Nat, acc: Acc, marks: List<&2, Nat>, tot: Tot) -> Out:
     case Acc{out, nout, bad, fbad, split, hits} Tot{rounds, steps, words, reads, lanemax, starved, over, w}:
       Out{Tot{rounds, steps, words, reads, lanemax, starved, over, why}, bad, fbad, split, hits, marks}
 
+# why the rounds stopped: a cut (2), else a drained queue (0), else the
+# round cap (1)
 def rounds.cap(q: List<&2, T>) -> Nat:
   match q:
     case Nil{}:
@@ -791,21 +804,30 @@ def rounds.cap(q: List<&2, T>) -> Nat:
     case h <> t:
       1n
 
-# at_walk1's loop: while words are queued, a round unless past rcap
-# rounds or rall steps
+def rounds.why(stop: Bool, q: List<&2, T>) -> Nat:
+  match stop:
+    case True{}:
+      2n
+    case False{}:
+      rounds.cap(q)
+
+# at_walk1's loop: a round while no dispatch was refused, words are
+# queued, and under rcap rounds
 def rounds(+heap: Heap, +cx: Cx, rf: Nat, p: Pre) -> Out:
   match rf p:
     case 0n Pre{q, nq, all, sp, acc, marks, seen, tot}:
-      finish(rounds.cap(q), acc, marks, tot)
+      finish(rounds.why(sp, q), acc, marks, tot)
     case 1n+rf2 Pre{q, +nq, +all, sp, acc, marks, seen, tot}:
       match q sp:
-        case Nil{} _:
-          finish(0n, acc, marks, tot)
+        case Nil{} True{}:
+          finish(2n, acc, marks, tot)
         case (t <> rest) True{}:
           finish(2n, acc, marks, tot)
+        case Nil{} False{}:
+          finish(0n, acc, marks, tot)
         case (t <> rest) False{}:
-          rounds(heap, cx, rf2, post(cx, all, lanes(heap, cx, reach_budget(nq), all, t <> rest, 0n,
-            Rd{Nat.is_le(all, Cx.rall(cx)), 0n, acc, marks, seen, tot})))
+          rounds(heap, cx, rf2, post(cx, all, lanes(heap, cx, reach_budget(nq), all, t <> rest, nq, 0n,
+            Rd{fits(cx, reach_budget(nq), all, 0n, nq), 0n, acc, marks, seen, tot})))
 
 def walk(+heap: Heap, +cx: Cx, +roots: List<&2, T>) -> Out:
   +n = List.length(&2, T, roots)

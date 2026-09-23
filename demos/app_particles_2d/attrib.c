@@ -259,11 +259,13 @@ static void at_enter(void) {
     at_dtag[c] = 0;
   }
   at_bump = HEAP_OFF + (bump << PAGE_BITS);
-  at_devn = n;
-  hipMemcpy(at_dev, (char*)gpu_vram + gpu_lo, n * GPU_CHUNK,
-    hipMemcpyDeviceToDevice);
+  // a failed snapshot compares nothing against it and ends the write
+  // recording (wr_enter)
+  bool dok = hipMemcpy(at_dev, (char*)gpu_vram + gpu_lo, n * GPU_CHUNK,
+    hipMemcpyDeviceToDevice) == hipSuccess;
+  at_devn = dok ? n : 0;
   at_arg_walk();
-  wr_enter(n);
+  wr_enter(n, dok);
   for (Cls c = 0; c < NCLS_ALL; c += 1) {
     Bank* b = bank_at(H, c);
     at_snap[c]  = realloc(at_snap[c], (b->rd + 1) * 8ull);

@@ -1,6 +1,5 @@
-// reach_dev, attrib.sh's device walk next to window_dev, and its host
-// rounds: the chunks a bang's result and argument words reach. It reads
-// the device's copy only: it moves no chunk and adds no fault.
+// reach_dev, attrib.sh's device walk, and its host rounds: the chunks a
+// bang's result and argument words reach, on the device's copy only.
 //@ kernel
 // A lane walks its queued word depth first like term_drop and marks the
 // 256 KB chunks it meets. It stops at leaves and tasks; strict (follow 0),
@@ -19,12 +18,13 @@
 #define RC_LANES (1u << 15)
 #define RC_WORK  (1u << 24)
 #define RC_SLACK ((1u << RC_PIECE) + 2 + RC_STACK)
-#define RC_ALL   (1ull << 28)  // a walk's steps, checked each dispatch
+#define RC_ALL   (1ull << 28)  // a walk's steps
 
-// a lane's steps in a round of nin: RC_WORK a dispatch; 64 while few,
-// so the walk fans out
+// a lane's steps in a round of nin, less RC_SLACK: RC_WORK a dispatch;
+// 64 while few, so the walk fans out
 INLINE u32 reach_budget(u32 nin) {
-  u32 b = nin < 4096 ? 64 : RC_WORK / (nin < RC_LANES ? nin : RC_LANES);
+  u32 b = nin < 4096 ? 64
+    : RC_WORK / (nin < RC_LANES ? nin : RC_LANES) - RC_SLACK;
   return b < 64 ? 64 : b > (1u << 14) ? 1u << 14 : b;
 }
 
@@ -177,6 +177,7 @@ static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
   u64 all = 0;  // steps
   u64 wds = 0;
   u32 got[16];
+  bool cut = false;
   static u32 up;  // 1 ready, 2 failed
   if (up == 0) {
     slim = lim;
@@ -194,21 +195,31 @@ static void at_walk1(const Term* roots, u32 n, u32 follow, u32* out, u64* w,
     && hipMemset(seen, 0, (slim - HEAP_OFF) / 8 + 8) == hipSuccess
     && hipMemcpy(av, at_arg, 64, hipMemcpyHostToDevice) == hipSuccess
     && hipMemcpy(q, roots, n * 8ull, hipMemcpyHostToDevice) == hipSuccess;
-  for (u32 nin = n, r = 0; ok && nin != 0; t[1] += 1, r += 1) {
-    if (r >= 4096 || all > RC_ALL) {
+  // a dispatch starts if lanes x (budget + RC_SLACK) fits in what is left
+  // of RC_ALL, else the walk is cut; then a drained queue, the round cap
+  for (u32 nin = n, r = 0; ok; t[1] += 1, r += 1) {
+    if (nin == 0 && !cut) {
+      break;
+    }
+    if (cut || r >= 4096) {
       at_over += 1;  // a cycle or a runaway: partial marks
       break;
     }
-    ok     = hipMemset(cnt, 0, 64) == hipSuccess;
-    got[10] = got[11] = 0;
-    for (u32 b = 0; ok && b < nin && all + (got[10] | (u64)got[11] << 32)
-      <= RC_ALL; b += RC_LANES) {
+    u32 budget = reach_budget(nin);
+    ok = hipMemset(cnt, 0, 64) == hipSuccess;
+    memset(got, 0, sizeof got);
+    for (u32 b = 0; ok && b < nin; b += RC_LANES) {
+      u32 lanes = nin - b < RC_LANES ? nin - b : RC_LANES;
+      if (all + (got[10] | (u64)got[11] << 32)
+        + (u64)lanes * (budget + RC_SLACK) > RC_ALL) {
+        cut = true;
+        break;
+      }
       struct { Corpus H; Term* q; u32* cnt; u32* mark; u32* seen; Term* av;
         u32* ab; u64 lo; u64 hi; u64 lim; u32 na; u32 base; u32 nin; u32 cap;
         u32 budget; u32 follow; } args = { gpu_vram, q, cnt, mark, seen, av,
         follow ? at_ab : NULL, gpu_lo, gpu_hi, lim, at_argn, b, nin, cap,
-        reach_budget(nin), follow };
-      u32    lanes = nin - b < RC_LANES ? nin - b : RC_LANES;
+        budget, follow };
       size_t len   = sizeof args;
       void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
         HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
@@ -279,30 +290,5 @@ static void at_reach_walk(Corpus H) {
     at_walk1(H + H_ROOT_WORD, n, 0, at_mark[0], w, w + 6);
     at_walk1(H + H_ROOT_WORD, n, 1, at_mark[1], w + 2, w + 6);
   }
-}
-
-static void at_walk_print(double f) {
-  static const char* what[4] = { "result", "result through sealed cells",
-    "argument words as it began", "argument word " };
-  for (u32 p = 0; p < 2; p += 1) {
-    for (u32 x = 0; x < 11; x += 1) {
-      u64* w = x < 3 ? at_walk[p] + 2 * x : at_warg[p][x - 3];
-      if (x < 3 || w[0] != 0) {
-        fprintf(stderr, "attrib: %s bang's %s%.1s reach %.0f words in %.1f"
-          " chunks\n", p ? "raster" : "sim", what[x < 3 ? x : 3],
-          x < 3 ? "" : &"01234567"[x - 3], w[0] / f, w[1] / f);
-      }
-    }
-    fprintf(stderr, "attrib: %s walks %.0f us, %.1f rounds\n",
-      p ? "raster" : "sim", at_walk[p][6] / f, at_walk[p][7] / f);
-  }
-  fprintf(stderr, "attrib: argument words met %llu, walks cut short %llu,"
-    " bad words %llu (first %llx), blocks split %llu, most steps a lane"
-    " %llu (bound %u), walks failed %llu%s\n",
-    (unsigned long long)at_hits, (unsigned long long)at_over,
-    (unsigned long long)at_bad, (unsigned long long)at_badt,
-    (unsigned long long)at_split, (unsigned long long)at_step,
-    (1u << 14) + RC_SLACK,
-    (unsigned long long)at_wfail, at_wfail ? ": MARKS NOT VALID" : "");
 }
 #endif

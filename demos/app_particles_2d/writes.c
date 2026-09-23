@@ -5,7 +5,7 @@
 // since the host's copy was current, and what a prefetch would take.
 //@ wdecl
 #if BEND_HIP
-static void wr_enter(u64 n);
+static void wr_enter(u64 n, bool dok);
 static void wr_leave(void);
 static void wr_fault(u64 c, u32 how, u32 r);
 static u32* at_ab;  // this turn's at_wa, for the result's walk
@@ -114,8 +114,9 @@ static void at_rot(u32 a, u32 b) {
   at_mark[a] = m;
 }
 
-// at the enter, after at_arg_walk (n: the chunks under the bump)
-static void wr_enter(u64 n) {
+// at the enter, after at_arg_walk (n: the chunks under the bump, dok:
+// their snapshot)
+static void wr_enter(u64 n, bool dok) {
   static const char* g[4] = { "at_wa", "at_wf", "at_w0", "at_wn" };
   u64 bb = at_nch * (GPU_CHUNK / 8) / 8;  // a bitmap's bytes
   u32 p  = at_bangs & 1;
@@ -148,15 +149,16 @@ static void wr_enter(u64 n) {
   u32 jb = p ? 0 : 1;  // Frame.show(+cells, old), Sim.run(+w)
   memset(at_bmark[p], 0, at_mw * 4);
   if (at_walks() && jb < at_argn && !term_triv(at_arg[jb])) {
-    u64 w[2], t[2];
+    u64 w[2] = { 0 }, t[2] = { 0 };
     at_walk1(at_arg + jb, 1, 1, at_bmark[p], w, t);
   }
-  at_snapc = n + 256 < at_nch ? n + 256 : at_nch;
+  // at_dev: the at_nch - 1 below gpu_hi
+  at_snapc = n + 256 < at_nch - 1 ? n + 256 : at_nch - 1;
   const char* rec = getenv("ATTRIB_WREC");
   void*       wa  = rec && !strcmp(rec, "0") ? NULL : at_wd[p];
   void*       wf  = wa ? at_wd[2] : NULL;
-  at_won = at_won && hipMemcpy(at_dev + n * GPU_CHUNK, (char*)gpu_vram
-    + gpu_lo + n * GPU_CHUNK, (at_snapc - n) * GPU_CHUNK,
+  at_won = at_won && dok && hipMemcpy(at_dev + n * GPU_CHUNK,
+    (char*)gpu_vram + gpu_lo + n * GPU_CHUNK, (at_snapc - n) * GPU_CHUNK,
     hipMemcpyDeviceToDevice) == hipSuccess && hipMemset(at_wd[p], 0, bb)
     == hipSuccess && hipMemset(at_wd[2], 0, bb) == hipSuccess
     && wr_set(0, &wa) && wr_set(1, &wf);
@@ -199,8 +201,9 @@ static void wr_leave(void) {
     for (u32 j = 0; ok && c < m && j < 8; j += 1) {
       t[1 + j] += k[j];
     }
-    at_wacc[c] |= (w << tp) | (!ok || c >= m ? 16 : 0) | (k[5] ? 4 : 0)
-      | (k[4] ? 8 : 0);
+    bool kn = ok && c < m;
+    at_wacc[c] |= (w << tp) | (kn ? 0 : 16) | (kn && k[5] ? 4 : 0)
+      | (kn && k[4] ? 8 : 0);
     u32 b = c >> 5;
     u32 s = c & 31;
     at_pf[c] = (at_mark[1][b] >> s & 1) | (at_bmark[1 - tp][b] >> s & 1)
