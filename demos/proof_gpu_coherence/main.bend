@@ -687,7 +687,7 @@ def claim.go(same: Bool, +g: Nat, +turns: Nat, +nc: Nat, k: Gk) -> Gk:
 def claim(+g: Nat, +turns: Nat, +nc: Nat, +k: Gk) -> Gk:
   claim.go(Bool.and(Gk.live(k), Nat.is_eq(Gk.key(k), g)), g, turns, nc, k)
 
-# the prefetch set under n: all (gpu_pf 2), the history (1), none (0)
+# the prefetch set under n: none (gpu_pf 0), all (2), else the history
 def pset.go(m: Nat, +n: Nat, hist: List<&2, Bool>) -> List<&2, Bool>:
   match m:
     case 0n:
@@ -697,7 +697,11 @@ def pset.go(m: Nat, +n: Nat, hist: List<&2, Bool>) -> List<&2, Bool>:
         case 0n:
           List.take(&2, Bool, hist, n)
         case 1n+q:
-          List.replicate(Bool, n, True{})
+          match q:
+            case 0n:
+              List.replicate(Bool, n, True{})
+            case 1n+r:
+              List.take(&2, Bool, hist, n)
 
 def count(bs: List<&2, Bool>) -> Nat:
   match bs:
@@ -867,7 +871,9 @@ def NoHw(ch: Ch) -> Type:
           Unit
 
 # during a turn, the chunks a bump sweeps under n were not written by
-# the host above n (the enter did not send them)
+# the host above n (the enter did not send them). "The host accesses
+# only under n" implies it (hw stays false); this weaker form lets the
+# laws cover a host write above n too (the stage-1 harness's t_clip)
 def Swept(ph: Ph, m: Nat, xs: List<&2, Ch>) -> Type:
   match ph:
     case Host{}:
@@ -881,7 +887,13 @@ def Swept(ph: Ph, m: Nat, xs: List<&2, Ch>) -> Type:
         case 1n+p h <> t:
           (NoHw(h) & Swept(Dev{}, p, t))
 
-# n only grows: m >= length(ins), and the sweep is clean
+# n only grows: m >= length(ins), and the sweep is clean. In the C, n
+# is H_BUMP's end rounded up to a chunk and clamped to [gpu_lo, gpu_hi];
+# H_BUMP only grows: heap_alloc adds to it before its capacity check
+# and a failure (ERR_HEAP) does not undo it, which keeps it growing,
+# and n clamps at gpu_hi. It holds unless the u32 H_BUMP wraps (2^32
+# pages reserved, failures included), which the model assumes never
+# happens
 def BOk(ph: Ph, ins: List<&2, Ch>, m: Nat, outs: List<&2, Ch>) -> Type:
   match ins:
     case Nil{}:
@@ -895,8 +907,16 @@ def BOk(ph: Ph, ins: List<&2, Ch>, m: Nat, outs: List<&2, Ch>) -> Type:
 
 # what each event needs: host accesses and fault steps between turns
 # (no host thread runs in a turn, the enter or the leave); an enter
-# with no thread in gpu_fault (the contract at comp.ts 5566-5572); a
-# device store under n, in a turn; n monotone
+# with no thread in gpu_fault (the contract at comp.ts 5566-5572; above
+# n none can be, those chunks never trap); a device store under n, in
+# a turn; n monotone.
+# Storage: every chunk starts with 0 on both sides, the value no one
+# wrote. The C zeroes VRAM only below STAK_OFF, and a bump sweeps in
+# storage never uploaded, so "the last write" means the last write to
+# a word written at all: the laws say nothing of a word read before
+# any side wrote it. That fresh bump memory is written before it is
+# read, on the host and on the device, is the runtime's obligation,
+# not checked here
 def Ok(s: Sys, e: Ev) -> Type:
   match s:
     case Sys{ph, +ins, +outs, hs}:
@@ -908,7 +928,7 @@ def Ok(s: Sys, e: Ev) -> Type:
         case Stp{c, k}:
           IsHost(ph)
         case Ent{k}:
-          (IsHost(ph) & (AllQ(ins) & AllQ(outs)))
+          (IsHost(ph) & AllQ(ins))
         case DWr{c, v}:
           (IsDev(ph) & LE(1n+c, len(ins)))
         case Bmp{m}:

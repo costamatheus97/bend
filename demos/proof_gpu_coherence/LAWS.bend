@@ -6,6 +6,7 @@
 # under n and m0 above; pfm is BEND_GPU_PREFETCH. PROOF.bend proves
 # them. They are about the model; the differential test outside the
 # repo ties the model to the C on its traces, nothing here proves the C.
+# Safety only: nothing here says a fault ever opens its chunk.
 import Base
 import ./main.bend as M
 

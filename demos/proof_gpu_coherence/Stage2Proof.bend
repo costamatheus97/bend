@@ -521,20 +521,16 @@ def ent_ok(hs: M.Hs, +k: Nat, +t: Nat, +ins: List<&2, M.Ch>, +outs: List<&2, M.C
               match ok:
                 case (u, x):
                   match x:
-                    case (qs, le):
-                      match qs:
-                        case (qi, qo):
-                          (en2s_ok(t, ins, qi, ai, le), ao)
+                    case (qi, le):
+                      (en2s_ok(t, ins, qi, ai, le), ao)
         case Some{j}:
           match i:
             case (ai, ao):
               match ok:
                 case (u, x):
                   match x:
-                    case (qs, le):
-                      match qs:
-                        case (qi, qo):
-                          (en2s_ok(t, ins, qi, ai, le), ao)
+                    case (qi, le):
+                      (en2s_ok(t, ins, qi, ai, le), ao)
 
 def dwr_ok(hs: M.Hs, +ins: List<&2, M.Ch>, +outs: List<&2, M.Ch>, +c: Nat, +v: Nat, +m: Bool, i: Inv2(M.Sys{M.Dev{}, ins, outs, hs}),
   ok: S.Ok(M.Sys{M.Dev{}, ins, outs, hs}, S.DWr{c, v, m})) -> Inv2(S.step(M.Sys{M.Dev{}, ins, outs, hs}, S.DWr{c, v, m})):
@@ -685,10 +681,8 @@ def k0_of(s: M.Sys, i: Inv2(s), +k: Nat, +t: Nat, ok: S.Ok(s, S.Ent{k, t})) -> S
               match ok:
                 case (u, x):
                   match x:
-                    case (qs, le):
-                      match qs:
-                        case (qi, qo):
-                          en2s_k0(ins, qi, ai)
+                    case (qi, le):
+                      en2s_k0(ins, qi, ai)
         case M.Dev{}:
           match ok:
             case (u, x):

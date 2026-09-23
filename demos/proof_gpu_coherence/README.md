@@ -1,66 +1,77 @@
 # GPU chunk coherence, proven
 
-A model of the HIP lane's lazy chunk protocol in `bend2/comp.ts` (as of
-32c8d44e: `gpu_fault`, `gpu_heap`'s enter and leave, `gpu_fetch`,
+A model of the HIP lane's lazy chunk protocol in `bend2/comp.ts` as of
+32c8d44e (`gpu_fault`, `gpu_heap`'s enter and leave, `gpu_fetch`,
 `gpu_touch`, `gpu_publish`), with its safety laws proven in Bend.
 
-- `main.bend`: the model. Per chunk: state (DIRTY, CLEAN, STALE,
-  FETCHED), host protection, host bytes (the alias maps the same pages),
-  device bytes, and a ghost holding the last value anyone wrote. Events
-  come at the C's atomicity: host read and write; a fault's later steps
-  as separate events (the lock-free CLEAN path's mprotect, then its
-  exchange; the locked STALE copy, mprotect, store; the locked FETCHED
-  recheck, mprotect, store); enter; device store; leave with its
-  history-driven prefetch; bump of n.
+- `main.bend`: the model. Per chunk: state, host protection, host and
+  device bytes, and a ghost holding the last write. Events at the C's
+  atomicity: host read and write, each later step of a fault, enter,
+  device store, leave with its prefetch, bump of n.
 - `LAWS.bend`: the laws, for any event list the hypotheses allow.
-- `Chunk.bend`, `PROOF.bend`: the invariant, its preservation by every
-  event, and the laws read off it.
+- `Chunk.bend`, `PROOF.bend`: the invariant, kept by every event.
 
-Check:
+`bun bend2/main.ts demos/proof_gpu_coherence/PROOF.bend --check-only`
 
-```sh
-bun bend2/main.ts demos/proof_gpu_coherence/PROOF.bend --check-only
-```
+## Laws (safety only)
 
-## Laws
+- L1: between turns, a chunk the host may read holds the last write.
+- L2 no lost write: between turns, a STALE chunk with no section open
+  traps and VRAM holds its last write, and a chunk the enter uploads is
+  readable; in a turn, every chunk under n holds its last write in VRAM.
+- L3: between turns, a FETCHED chunk with no section open traps, and
+  its host bytes equal VRAM and the last write.
+- L4: per chunk, FETCHED (0 or 1) plus used equals whether the leave
+  fetched it.
 
-- L1 read freshness: between turns, a chunk the host may read holds the
-  last value anyone wrote.
-- L2 no lost write: between turns, a STALE chunk with no lock section
-  open traps and the device holds its last write, and a chunk the enter
-  uploads is readable; in a turn, every chunk under n holds its last
-  write on the device.
-- L3 prefetch integrity: between turns, a FETCHED chunk with no section
-  open traps and its host bytes equal the device's and the last write.
-- L4 used once: per chunk, FETCHED (0 or 1) plus its used count equals
-  whether this interval's leave fetched it.
+No liveness: a fault handler that never opens a chunk keeps them all.
 
 ## Hypotheses (`Ok` in main.bend)
 
-- Host accesses and fault steps run only between turns, and an enter
-  finds no thread inside `gpu_fault` (comp.ts 5566-5572).
+- Host accesses and fault steps run between turns; an enter finds no
+  thread in `gpu_fault` (5566-5572).
 - The device stores only under n.
-- n only grows. Without it a chunk the device wrote, then left above a
-  shrunken n, keeps an old prefetch that a read opens (L1), and a host
-  write left above n misses the upload (L2): the residual risk the C
-  documents.
-- A bump in a turn sweeps no chunk the host wrote while it was above n.
+- n only grows: `heap_alloc` adds to H_BUMP before its capacity check
+  and ERR_HEAP keeps the add, n clamps at gpu_hi, and the u32 is
+  assumed never to wrap. A shrunken n breaks L1 and L2.
+- A bump in a turn sweeps no chunk the host wrote above n (implied by
+  "the host accesses only under its bump").
+- Fresh bump memory is written before it is read, on both sides: the
+  model starts every word at 0, the C zeroes VRAM only below STAK_OFF.
 
-The laws hold for any prefetch set, so they do not depend on the
-history. Not modelled: chunk runs and the GAP merge (upload per chunk),
-the memfd layout, the zero-fill region, the counters' timing fields,
-real concurrency of the device with the host (turns are exclusive).
+## Not modelled
+
+Chunk runs and the GAP merge; the memfd layout; timing counters; the
+device running beside the host (turns are exclusive); weak memory (the
+model is sequentially consistent); the global fault lock (a per-chunk
+lock over-approximates it); a trap and its first state load are one
+step, so a load that finds the chunk opened by another thread is
+served, argued rather than modelled; `wr == 2`; mprotect and hipMemcpy
+failures; `gpu_show`'s upload. The laws hold for any prefetch set.
+
+## Tested against the C
+
+`logs/cohmodel` (outside the repo) runs the C's functions, extracted
+from 32c8d44e, one pthread per access, against the model: heap ends
+inside, below and above [gpu_lo, gpu_hi], bumps in turns (VRAM header
+only), late state loads that are served. It compares the first, middle
+and last word of each chunk, not every word.
 
 ## Stage 2 preview
 
-`Stage2.bend` models OPTIONS-DESIGN.md §2-§3 before it is built: the
-device marks what it writes, the enter makes uploads CLEAN and read
-only, and the leave invalidates only the marked chunks and those from
-the ceiling (the chunk holding the enter's `H_TWIN_HI`) up.
-`Stage2Laws.bend` states L1-L4 again, plus L5 (an unmarked chunk under
-the ceiling is one the leave may keep) and K0 (right after the
-uploads, every chunk that is not STALE equals VRAM);
-`Stage2Proof.bend` proves them. Its extra hypotheses: a device store
-that does not mark lands at or above the ceiling, and the ceiling is
-under n at the enter. L4 holds per fetch: a FETCHED chunk the leave
-keeps is counted unused again at the next enter.
+`Stage2.bend` models OPTIONS-DESIGN.md §2-§3: the device marks what it
+writes, the enter makes uploads CLEAN and read only, the leave
+invalidates the marked chunks and those from the ceiling (the chunk of
+the enter's `H_TWIN_HI`) up. `Stage2Laws.bend` states L1-L4, L5 (an
+unmarked chunk under the ceiling may be kept) and K0 (after the
+uploads, every chunk not STALE equals VRAM); `Stage2Proof.bend` proves
+them, given that an unmarked device store lands at or above the
+ceiling and the ceiling is under n.
+
+For the stage-2 C: a kept FETCHED chunk's used/unused counts cross
+keys (waste can pass 100%; record the fetch's owner or epoch); kept
+CLEAN chunks leave the history (reads never fault, CLEAN writes skip
+`gpu_cur`); the ceiling rounds down; uploads go read only (left DIRTY,
+a write faults forever). The model covers strict marking only, not the
+RET_H dead-slot exemptions or the two-extent allocator, and its states
+are relative to gpu_lo: the C's map, by absolute chunk, must offset.

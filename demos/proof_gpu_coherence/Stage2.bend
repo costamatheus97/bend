@@ -201,7 +201,7 @@ def Ok(s: M.Sys, e: Ev) -> Type:
         case Stp{c, k}:
           M.IsHost(ph)
         case Ent{k, t}:
-          (M.IsHost(ph) & ((M.AllQ(ins) & M.AllQ(outs)) & M.LE(t, M.len(ins))))
+          (M.IsHost(ph) & (M.AllQ(ins) & M.LE(t, M.len(ins))))
         case DWr{+c, v, m}:
           (M.IsDev(ph) & (M.LE(1n+c, M.len(ins)) & Hs.ok(hs, m, c)))
         case Bmp{m}:

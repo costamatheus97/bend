@@ -574,10 +574,8 @@ def inv_step(s: M.Sys, e: M.Ev, i: Ck.Inv(s), ok: M.Ok(s, e)) -> Ck.Inv(M.step(s
               match i:
                 case (ai, ao):
                   match ok:
-                    case (u, qs):
-                      match qs:
-                        case (qi, qo):
-                          (en1s_ok(ins, qi, ai), ao)
+                    case (u, qi):
+                      (en1s_ok(ins, qi, ai), ao)
             case M.Bmp{+m}:
               match i:
                 case (ai, ao):
