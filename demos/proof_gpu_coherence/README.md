@@ -49,5 +49,18 @@ bun bend2/main.ts demos/proof_gpu_coherence/PROOF.bend --check-only
 The laws hold for any prefetch set, so they do not depend on the
 history. Not modelled: chunk runs and the GAP merge (upload per chunk),
 the memfd layout, the zero-fill region, the counters' timing fields,
-real concurrency of the device with the host (turns are exclusive),
-and the stage-2 write map (see Stage2*.bend when present).
+real concurrency of the device with the host (turns are exclusive).
+
+## Stage 2 preview
+
+`Stage2.bend` models OPTIONS-DESIGN.md §2-§3 before it is built: the
+device marks what it writes, the enter makes uploads CLEAN and read
+only, and the leave invalidates only the marked chunks and those from
+the ceiling (the chunk holding the enter's `H_TWIN_HI`) up.
+`Stage2Laws.bend` states L1-L4 again, plus L5 (an unmarked chunk under
+the ceiling is one the leave may keep) and K0 (right after the
+uploads, every chunk that is not STALE equals VRAM);
+`Stage2Proof.bend` proves them. Its extra hypotheses: a device store
+that does not mark lands at or above the ceiling, and the ceiling is
+under n at the enter. L4 holds per fetch: a FETCHED chunk the leave
+keeps is counted unused again at the next enter.
