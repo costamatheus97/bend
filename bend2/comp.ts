@@ -5356,8 +5356,8 @@ static u64*  gpu_cur;           // the chunks the host touched since the leave
 typedef struct {
   u32 key;
   u64 last, *hist;  // its last leave; its last interval's touches
-  unsigned long long demand, hits, used, unused, chunks, runs, copy_ns,
-    touch_ns;
+  unsigned long long demand, hits, used, unused, chunks, runs, leave_ns,
+    copy_ns, touch_ns;
 } GpuKey;
 static GpuKey  gpu_keys[GPU_KEYS];  // the least recently left goes first
 static GpuKey* gpu_at;              // the key whose leave opened the interval
@@ -5412,9 +5412,10 @@ static void gpu_stats(void) {
   }
   for (GpuKey* k = gpu_keys; k < gpu_keys + GPU_KEYS && k->hist; k += 1) {
     fprintf(stderr, "bend: hip   key %u: %llu demand (%llu in history), %llu"
-      " used, %llu unused, %llu fetched in %llu runs %llu us, touch %llu us,"
-      " coverage %.1f%%, waste %.1f%%\n", k->key, k->demand, k->hits, k->used,
-      k->unused, k->chunks, k->runs, k->copy_ns / 1000, k->touch_ns / 1000,
+      " used, %llu unused, %llu fetched in %llu runs, leave %llu us (copies"
+      " %llu), touch %llu us, coverage %.1f%%, waste %.1f%%\n", k->key,
+      k->demand, k->hits, k->used, k->unused, k->chunks, k->runs,
+      k->leave_ns / 1000, k->copy_ns / 1000, k->touch_ns / 1000,
       100.0 * k->used / (k->used + k->demand + !k->used),
       100.0 * k->unused / (k->chunks + !k->chunks));
   }
@@ -5708,9 +5709,9 @@ static bool gpu_fault(void* addr, u32 wr) {
     return ok;
   }
   if (s == GPU_FETCHED) {
+    u64 t0 = gpu_stat ? io_tick() : 0;  // the lock's wait counts
     LOCK(gpu_fault_lock);
     if (__atomic_load_n(st, __ATOMIC_RELAXED) == GPU_FETCHED) {
-      u64 t0 = gpu_stat ? io_tick() : 0;
       ok = mprotect((char*)CORPUS + at, GPU_CHUNK,
         wr == 1 ? PROT_READ | PROT_WRITE : PROT_READ) == 0;
       if (ok) {
@@ -5753,6 +5754,7 @@ static bool gpu_fault(void* addr, u32 wr) {
 // what a turn can touch, but the lanes' stacks; down, the header leads
 static void gpu_sync(bool up) {
   Corpus H = CORPUS;
+  u64    t0 = gpu_stat ? io_tick() : 0;
   gpu_turns += up;
   if (up) {
     gpu_publish();
@@ -5774,6 +5776,9 @@ static void gpu_sync(bool up) {
     }
   }
   gpu_part = 0;
+  if (!up && gpu_stat) {
+    gpu_at->leave_ns += io_tick() - t0;  // gpu_heap's fetch set gpu_at
+  }
 }
 
 #define gpu_enter(k) (gpu_key = (k), gpu_sync(true))
