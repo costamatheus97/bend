@@ -5449,10 +5449,12 @@ static bool gpu_probe(void) {
 // filled. A chunk no turn has left behind yet is dirty, as it always was.
 // An upload may span GPU_GAP clean chunks between dirty ones: 0, as the
 // particles at 262,144 lost more to the bytes than they saved in calls.
-// BEND_GPU_PREFETCH=1: a leave also brings down, in runs, what the host
-// touched after the last leave of the same bang (its key). Such a chunk is
-// fetched: current, still trapping, opened by a touch with no copy, never
-// sent up. =2 fetches every chunk.
+// BEND_GPU_PREFETCH=1 (the default): a leave also brings down, in runs,
+// what the host touched after the last leave of the same bang (its key).
+// Such a chunk is fetched: current, still trapping, opened by a touch with
+// no copy, never sent up. A key's first leave has no history, so it
+// fetches nothing: a one-turn program pays nothing. =0 fetches nothing,
+// =2 every chunk.
 #define GPU_CHUNK   (1ull << 18)
 #define GPU_GAP     0
 #define GPU_DIRTY   0
@@ -5655,7 +5657,7 @@ static void gpu_load(u64 bytes) {
   }
   gpu_env(false);
   const char* pf = getenv("BEND_GPU_PREFETCH");
-  gpu_pf   = pf == NULL ? 0 : (u32)atoi(pf);
+  gpu_pf   = pf == NULL ? 1 : (u32)atoi(pf);
   gpu_stat = getenv("BEND_GPU_STATS") != NULL;
   gpu_check = getenv("BEND_GPU_CHECK") != NULL
     && strcmp(getenv("BEND_GPU_CHECK"), "0") != 0;
