@@ -1,8 +1,14 @@
-# Particles 2D: a pure particle bang, host projection/binning, and a pure
-# raster bang per frame. PARTICLES_SCALE selects 1024, 4096, 16384, 65536
-# (default), 262144 or 1048576 particles, a quadtree of depth 3 to 8 with 16
-# per leaf. PARTICLES_PROBE=N runs N measured headless frames after eight
-# warmups and prints stage medians plus deterministic checksums.
+# Particles 2D: a pure particle bang, projection/binning into cells, and a
+# pure raster bang per frame. PARTICLES_BIN picks where the binning runs:
+# host (default) between the two bangs; device, inside the raster bang, so
+# the host never walks the world; fused, one bang a frame for all three.
+# Every mode draws the same pixels. PARTICLES_SCALE selects 1024, 4096,
+# 16384, 65536 (default), 262144 or 1048576 particles, a quadtree of depth 3
+# to 8 with 16 per leaf. PARTICLES_PROBE=N runs N measured headless frames
+# after eight warmups and prints stage medians plus deterministic checksums:
+# sim, bin and raster are the clock gaps around each step (see Frame.step),
+# so device puts its binning under raster (bin ~0) and fused its whole frame
+# under raster (sim and bin ~0).
 import Base
 import ../app_slash_boss_3d/bend3d.bend as R
 
@@ -202,7 +208,7 @@ def Sprite.add(+p: Particle, c: R.Cells) -> R.Cells:
     R.Vert{(x + 1.4 : F32), (y + 1.2 : F32), 1.0, r, g, b}, 0, 1.0,
     1023.0, 767.0, c)
 
-# Host leaf projection/binning is a flat tail loop and only borrows ps.
+# Leaf projection/binning is a flat tail loop and only borrows ps.
 def Bin.parts(+ps: Parts, c: R.Cells) -> R.Cells:
   match ps:
     case PNil{}:
@@ -210,22 +216,56 @@ def Bin.parts(+ps: Parts, c: R.Cells) -> R.Cells:
     case PCons{p, rest}:
       Bin.parts(rest, Sprite.add(p, c))
 
-# One parallel let per recursive definition keeps host binning to one fork
+# Cells.m4 merges on one lane: at the root of a 262,144-particle world
+# that walks every list on one lane. Pm.m2 is Cells.merge forked over k
+# levels of the cell quadtree: an empty side gives the other whole, two
+# quads merge child by child, anything else is Cells.merge, so the lists
+# and their order are the same.
+def Pm.m2(+k: Nat, a: R.Cells, b: R.Cells) -> R.Cells:
+  match k a b:
+    case _ R.CNil{} y:
+      y
+    case _ x R.CNil{}:
+      x
+    case 1n+e R.CQua{a1, a2, a3, a4} R.CQua{b1, b2, b3, b4}:
+      p q r t = Pm.m2(e, a1, b1) Pm.m2(e, a2, b2) Pm.m2(e, a3, b3) Pm.m2(e, a4, b4)
+      R.CQua{p, q, r, t}
+    case _ x y:
+      R.Cells.merge(x, y)
+
+# Cells.m4's merge(merge(a, b), merge(c, d)), each merge forked.
+def Pm.m4(a: R.Cells, b: R.Cells, c: R.Cells, d: R.Cells) -> R.Cells:
+  x y = Pm.m2(5n, a, b) Pm.m2(5n, c, d)
+  Pm.m2(5n, x, y)
+
+def Bin.join(big: Bool, a: R.Cells, b: R.Cells, c: R.Cells, d: R.Cells) -> R.Cells:
+  match big:
+    case True{}:
+      Pm.m4(a, b, c, d)
+    case False{}:
+      R.Cells.m4(a, b, c, d)
+
+# One parallel let per recursive definition keeps binning to one fork
 # frontier. It returns only cells, so the simulated world remains borrowed.
-def Bin.node(d: Nat, +w: World) -> R.Cells:
+# A join forks its merge when the world is wide (65,536 and up) and its
+# children hold 1,024 particles or more; below that the forks cost more
+# than the lane they save (logs/fps2).
+def Bin.node(+wide: Bool, d: Nat, +w: World) -> R.Cells:
   match d w:
     case 0n WLeaf{ps}:
       Bin.parts(ps, R.CNil{})
     case 1n++e WQuad{tl, tr, bl, br}:
-      a b c d = Bin.node(e, tl) Bin.node(e, tr) Bin.node(e, bl) Bin.node(e, br)
-      R.Cells.m4(a, b, c, d)
+      a b c d = Bin.node(wide, e, tl) Bin.node(wide, e, tr) Bin.node(wide, e, bl)
+        Bin.node(wide, e, br)
+      Bin.join(Bool.and(wide, (U32.from_nat(e) >= 3 : U32)), a, b, c, d)
     case _ WLeaf{ps}:
       Bin.parts(ps, R.CNil{})
     case _ WQuad{_, _, _, _}:
       R.CNil{}
 
+# The cells of a frame; last frame's are freed as a branch of the build.
 def Scene.build(~depth: Nat, +world: World, used: R.Cells) -> R.Cells:
-  fresh gone = Bin.node(depth, world) R.Cells.drop(4n, used)
+  fresh gone = Bin.node((U32.from_nat(depth) >= 6 : U32), depth, world) R.Cells.drop(4n, used)
   R.Cells.merge(fresh, gone)
 
 def Scene.d3(+world: World, used: R.Cells) -> R.Cells:
@@ -252,6 +292,11 @@ def Hook.sim() -> Type:
 def Hook.bin() -> Type:
   @+world: World -> R.Cells -> R.Cells
 
+# A device frame: the world, last frame's cells and image in; the new
+# image, cells and world out.
+def Hook.draw() -> Type:
+  @+world: World -> R.Cells -> Image -> (Image & R.Cells) & World
+
 type Sky is Data:
   Sky{}
 
@@ -272,11 +317,100 @@ def Sky.at(+x: U32, +y: U32, +sky: Sky) -> U32:
 def Frame.show(+cells: R.Cells, old: Image) -> Image & R.Cells:
   R.Frame.show(~Sky, ~Sky.of, ~Sky.flat, ~Sky.col, ~Sky.at, ~Screen.w, ~Screen.h, cells, old)
 
+# Device binning (PARTICLES_BIN=device): the raster turn builds the cells
+# itself, the same Scene.build the host runs, so the host never walks the
+# world the sim turn wrote. Last frame's cells stay on the device: the turn
+# drops them as a branch of the build. The tree is borrowed and returned,
+# as in Frame.show.
+def Dev.raster(+cells: R.Cells, old: Image) -> Image & R.Cells:
+  (R.Frame.node(~Sky, ~Sky.of, ~Sky.flat, ~Sky.col, ~Sky.at, ~Screen.w, ~Screen.h, cells, 5n, 0,
+    0, R.Image.open(old)), cells)
+
+def Dev.build(~depth: Nat, +world: World, used: R.Cells, old: Image) -> Image & R.Cells:
+  Dev.raster(Scene.build(~depth, world, used), old)
+
+# The world is borrowed by the turn and comes back beside the image.
+def Dev.run(~depth: Nat, +world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  (Dev.build!(~depth, world, used, old), world)
+
+def Dev.d3(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Dev.run(~Depth.tiny, world, used, old)
+
+def Dev.d4(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Dev.run(~Depth.little, world, used, old)
+
+def Dev.d5(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Dev.run(~Depth.small, world, used, old)
+
+def Dev.d6(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Dev.run(~Depth.medium, world, used, old)
+
+def Dev.d7(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Dev.run(~Depth.large, world, used, old)
+
+def Dev.d8(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Dev.run(~Depth.huge, world, used, old)
+
+# One turn a frame (PARTICLES_BIN=fused): sim, bin and raster in one bang.
+def Fused.draw(~depth: Nat, +next: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  (Dev.build(~depth, next, used, old), next)
+
+def Fused.build(~depth: Nat, +world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.draw(~depth, Sim.node(depth, world), used, old)
+
+def Fused.run(~depth: Nat, +world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.build!(~depth, world, used, old)
+
+def Fused.d3(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.run(~Depth.tiny, world, used, old)
+
+def Fused.d4(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.run(~Depth.little, world, used, old)
+
+def Fused.d5(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.run(~Depth.small, world, used, old)
+
+def Fused.d6(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.run(~Depth.medium, world, used, old)
+
+def Fused.d7(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.run(~Depth.large, world, used, old)
+
+def Fused.d8(+world: World, used: R.Cells, old: Image) -> (Image & R.Cells) & World:
+  Fused.run(~Depth.huge, world, used, old)
+
 type Sample is Data:
   Sample{sim: U32, bin: U32, raster: U32, total: U32}
 
 type Stats is Data:
   Stats{sim: List<&2, U32>, bin: List<&2, U32>, raster: List<&2, U32>, total: List<&2, U32>}
+
+type Mode is Data:
+  BinHost{}
+  BinDevice{}
+  BinFused{}
+
+def Mode.show(+m: Mode) -> String:
+  match m:
+    case BinHost{}:
+      "host"
+    case BinDevice{}:
+      "device"
+    case BinFused{}:
+      "fused"
+
+# One frame's world, image and cells, and its stage times.
+type Step is Data:
+  Step{world: World, img: Image, used: R.Cells, sample: Sample}
+
+def Step.of(world: World, drawn: Image & R.Cells, +t0: U32, +t1: U32, +t2: U32, +t3: U32) -> Step:
+  (img, used) = drawn
+  Step{world, img, used, Sample{(t1 - t0 : U32), (t2 - t1 : U32), (t3 - t2 : U32),
+    (t3 - t0 : U32)}}
+
+def Step.turn(both: (Image & R.Cells) & World, +t0: U32, +t1: U32, +t2: U32, +t3: U32) -> Step:
+  (drawn, world) = both
+  Step.of(world, drawn, t0, t1, t2, t3)
 
 def Stats.put(warm: Bool, +s: Sample, stats: Stats) -> Stats:
   match warm:
@@ -358,19 +492,17 @@ def Probe.finish(stats: Stats, world: World, img: Image, used: R.Cells) -> IO(Un
   Probe.report(stats, Image.checksum(img, 0, 0, 2048), World.checksum(world),
     R.Cells.drop(4n, used))
 
-# Clock effects delimit the pure simulation bang, host bin, and pure raster
-# bang. No bang appears directly in this do continuation.
-def Probe.loop(
-  ~sim: Hook.sim(), ~bin: Hook.bin(), left: Nat, +frame: U32, world: World,
-  last: Image & R.Cells, stats: Stats
-) -> IO(Unit):
-  match left:
-    case 0n:
-      (old, used) = last
-      Probe.finish(stats, world, old, used)
-    case 1n+k:
-      (old, used) = last
-      do IO<Unit>:
+# One frame. Clock effects delimit the stages; no bang appears directly in
+# a do continuation. host: sim turn | host bin | raster turn. device: sim
+# turn | nothing (bin ~0) | bin + raster turn. fused: nothing | nothing |
+# one sim + bin + raster turn.
+def Frame.step(
+  ~sim: Hook.sim(), ~bin: Hook.bin(), ~dev: Hook.draw(), ~fused: Hook.draw(), +mode: Mode,
+  world: World, used: R.Cells, old: Image
+) -> IO(Step):
+  match mode:
+    case BinHost{}:
+      do IO<Step>:
         +t0 : U32 <- Clock.us()
         +next : World <- IO.pure(World, sim(world))
         +t1 : U32 <- Clock.us()
@@ -378,18 +510,54 @@ def Probe.loop(
         +t2 : U32 <- Clock.us()
         drawn : Image & R.Cells <- IO.pure(Image & R.Cells, Frame.show(cells, old))
         +t3 : U32 <- Clock.us()
-        sample : Sample = {Sample{(t1 - t0 : U32), (t2 - t1 : U32),
-          (t3 - t2 : U32), (t3 - t0 : U32)} : Sample}
-        Probe.loop(~sim, ~bin, k, (frame + 1 : U32), next, drawn,
-          Stats.put((frame < 8 : U32), sample, stats))
+        IO.pure(Step, Step.of(next, drawn, t0, t1, t2, t3))
+    case BinDevice{}:
+      do IO<Step>:
+        +t0 : U32 <- Clock.us()
+        +next : World <- IO.pure(World, sim(world))
+        +t1 : U32 <- Clock.us()
+        +t2 : U32 <- Clock.us()
+        both : (Image & R.Cells) & World <- IO.pure((Image & R.Cells) & World, dev(next, used, old))
+        +t3 : U32 <- Clock.us()
+        IO.pure(Step, Step.turn(both, t0, t1, t2, t3))
+    case BinFused{}:
+      do IO<Step>:
+        +t0 : U32 <- Clock.us()
+        +t1 : U32 <- Clock.us()
+        +t2 : U32 <- Clock.us()
+        both : (Image & R.Cells) & World <- IO.pure((Image & R.Cells) & World, fused(world, used, old))
+        +t3 : U32 <- Clock.us()
+        IO.pure(Step, Step.turn(both, t0, t1, t2, t3))
 
-def Probe.run(~depth: Nat, ~sim: Hook.sim(), ~bin: Hook.bin(), +frames: U32) -> IO(Unit):
+# The state holds the last frame's sample: frame 0's is a placeholder,
+# and it and the first eight frames are warmups.
+def Probe.loop(
+  ~sim: Hook.sim(), ~bin: Hook.bin(), ~dev: Hook.draw(), ~fused: Hook.draw(), +mode: Mode,
+  left: Nat, +frame: U32, now: Step, stats: Stats
+) -> IO(Unit):
+  match left:
+    case 0n:
+      Step{world, old, used, sample} = now
+      Probe.finish(Stats.put((frame < 9 : U32), sample, stats), world, old, used)
+    case 1n+k:
+      Step{world, old, used, sample} = now
+      do IO<Unit>:
+        next : Step <- Frame.step(~sim, ~bin, ~dev, ~fused, mode, world, used, old)
+        Probe.loop(~sim, ~bin, ~dev, ~fused, mode, k, (frame + 1 : U32), next,
+          Stats.put((frame < 9 : U32), sample, stats))
+
+def Probe.run(
+  ~depth: Nat, ~sim: Hook.sim(), ~bin: Hook.bin(), ~dev: Hook.draw(), ~fused: Hook.draw(),
+  +mode: Mode, +frames: U32
+) -> IO(Unit):
   +particles = Scale.total(~Particles.k, depth)
   do IO<Unit>:
     Unit <- IO.print("particles=" ++ U32.show(particles) ++ " frames=" ++ U32.show(frames)
       ++ " warmup=8")
-    Probe.loop(~sim, ~bin, Nat.add(U32.to_nat(frames), 8n), 0,
-      Init.tree(~Particles.k, depth, 0), (Pix{0}, R.CNil{}), Stats{Nil{}, Nil{}, Nil{}, Nil{}})
+    Unit <- IO.print("bin=" ++ Mode.show(mode))
+    Probe.loop(~sim, ~bin, ~dev, ~fused, mode, Nat.add(U32.to_nat(frames), 8n), 0,
+      Step{Init.tree(~Particles.k, depth, 0), Pix{0}, R.CNil{}, Sample{0, 0, 0, 0}},
+      Stats{Nil{}, Nil{}, Nil{}, Nil{}})
 
 type Live is Type:
   Live{world: World, used: R.Cells, window: Window, old: Image, events: List<Event>}
@@ -398,14 +566,17 @@ def Play.pack(world: World, used: R.Cells, shown: Window & Image & List<Event>) 
   (window, image, events) = shown
   Live{world, used, window, image, events}
 
-def Play.present(window: Window, world: World, drawn: Image & R.Cells) -> IO(Live):
-  (img, retained) = drawn
+def Play.present(window: Window, step: Step) -> IO(Live):
+  Step{world, img, retained, _} = step
   do IO<Live>:
     shown : Window & Image & List<Event> <- Window.frame(window, img)
     IO.pure(Live, Play.pack(world, retained, shown))
 
 @unsafe
-def Play.loop(~sim: Hook.sim(), ~bin: Hook.bin(), live: Live) -> IO(Unit):
+def Play.loop(
+  ~sim: Hook.sim(), ~bin: Hook.bin(), ~dev: Hook.draw(), ~fused: Hook.draw(), +mode: Mode,
+  live: Live
+) -> IO(Unit):
   Live{world, used, window, old, events} = live
   match events:
     case Key{27, True{}} <> rest:
@@ -413,56 +584,79 @@ def Play.loop(~sim: Hook.sim(), ~bin: Hook.bin(), live: Live) -> IO(Unit):
     case Close{} <> rest:
       Window.close(window)
     case _ <> rest:
-      Play.loop(~sim, ~bin, Live{world, used, window, old, rest})
+      Play.loop(~sim, ~bin, ~dev, ~fused, mode, Live{world, used, window, old, rest})
     case Nil{}:
       do IO<Unit>:
-        before : U32 <- Clock.us()
-        +next : World <- IO.pure(World, sim(world))
-        after_sim : U32 <- Clock.us()
-        cells : R.Cells = bin(next, used)
-        after_bin : U32 <- Clock.us()
-        drawn : Image & R.Cells <- IO.pure(Image & R.Cells, Frame.show(cells, old))
-        next_live : Live <- Play.present(window, next, drawn)
-        Play.loop(~sim, ~bin, next_live)
+        step : Step <- Frame.step(~sim, ~bin, ~dev, ~fused, mode, world, used, old)
+        next_live : Live <- Play.present(window, step)
+        Play.loop(~sim, ~bin, ~dev, ~fused, mode, next_live)
 
-def Play.run(~depth: Nat, ~sim: Hook.sim(), ~bin: Hook.bin()) -> IO(Unit):
+def Play.run(
+  ~depth: Nat, ~sim: Hook.sim(), ~bin: Hook.bin(), ~dev: Hook.draw(), ~fused: Hook.draw(),
+  +mode: Mode
+) -> IO(Unit):
   do IO<Unit>:
     window : Window <- IO.try(Window, Window.open("Particles 2D", Screen.w(), Screen.h()))
-    Play.loop(~sim, ~bin,
+    Play.loop(~sim, ~bin, ~dev, ~fused, mode,
       Live{Init.tree(~Particles.k, depth, 0), R.CNil{}, window, Pix{0}, Nil{}})
 
 def Main.mode(
-  ~depth: Nat, ~sim: Hook.sim(), ~bin: Hook.bin(), probe: Result<&1, &1, U32 & String, String>
+  ~depth: Nat, ~sim: Hook.sim(), ~bin: Hook.bin(), ~dev: Hook.draw(), ~fused: Hook.draw(),
+  +mode: Mode, probe: Result<&1, &1, U32 & String, String>
 ) -> IO(Unit):
   match probe:
     case Fail{_}:
-      Play.run(~depth, ~sim, ~bin)
+      Play.run(~depth, ~sim, ~bin, ~dev, ~fused, mode)
     case Done{text}:
-      Probe.run(~depth, ~sim, ~bin, Env.u32(U32.read(text), 120))
+      Probe.run(~depth, ~sim, ~bin, ~dev, ~fused, mode, Env.u32(U32.read(text), 120))
 
 # The first flag set picks its depth; none picks the default, depth 6.
 def Main.scale(
-  tiny: Bool, little: Bool, small: Bool, large: Bool, huge: Bool,
+  tiny: Bool, little: Bool, small: Bool, large: Bool, huge: Bool, +mode: Mode,
   probe: Result<&1, &1, U32 & String, String>
 ) -> IO(Unit):
   match tiny little small large huge:
     case True{} _ _ _ _:
-      Main.mode(~Depth.tiny, ~Sim.d3, ~Scene.d3, probe)
+      Main.mode(~Depth.tiny, ~Sim.d3, ~Scene.d3, ~Dev.d3, ~Fused.d3, mode,
+        probe)
     case _ True{} _ _ _:
-      Main.mode(~Depth.little, ~Sim.d4, ~Scene.d4, probe)
+      Main.mode(~Depth.little, ~Sim.d4, ~Scene.d4, ~Dev.d4, ~Fused.d4, mode,
+        probe)
     case _ _ True{} _ _:
-      Main.mode(~Depth.small, ~Sim.d5, ~Scene.d5, probe)
+      Main.mode(~Depth.small, ~Sim.d5, ~Scene.d5, ~Dev.d5, ~Fused.d5, mode,
+        probe)
     case _ _ _ True{} _:
-      Main.mode(~Depth.large, ~Sim.d7, ~Scene.d7, probe)
+      Main.mode(~Depth.large, ~Sim.d7, ~Scene.d7, ~Dev.d7, ~Fused.d7, mode,
+        probe)
     case _ _ _ _ True{}:
-      Main.mode(~Depth.huge, ~Sim.d8, ~Scene.d8, probe)
+      Main.mode(~Depth.huge, ~Sim.d8, ~Scene.d8, ~Dev.d8, ~Fused.d8, mode,
+        probe)
     case _ _ _ _ _:
-      Main.mode(~Depth.medium, ~Sim.d6, ~Scene.d6, probe)
+      Main.mode(~Depth.medium, ~Sim.d6, ~Scene.d6, ~Dev.d6, ~Fused.d6, mode,
+        probe)
+
+# PARTICLES_BIN: host (default), device or fused; anything else is host.
+def Mode.pick(device: Bool, fused: Bool) -> Mode:
+  match device fused:
+    case True{} _:
+      BinDevice{}
+    case _ True{}:
+      BinFused{}
+    case _ _:
+      BinHost{}
+
+def Mode.of(r: Result<&1, &1, U32 & String, String>) -> Mode:
+  match r:
+    case Fail{_}:
+      BinHost{}
+    case Done{+text}:
+      Mode.pick(String.eq(text, "device"), String.eq(text, "fused"))
 
 def main() -> IO(Unit):
   do IO<Unit>:
     scale_env : Result<&1, &1, U32 & String, String> <- IO.get_env("PARTICLES_SCALE")
     probe : Result<&1, &1, U32 & String, String> <- IO.get_env("PARTICLES_PROBE")
+    bin_env : Result<&1, &1, U32 & String, String> <- IO.get_env("PARTICLES_BIN")
     +scale : U32 = Env.num(scale_env, 65536)
     Main.scale(U32.is_eq(scale, 1024), U32.is_eq(scale, 4096), U32.is_eq(scale, 16384),
-      U32.is_eq(scale, 262144), U32.is_eq(scale, 1048576), probe)
+      U32.is_eq(scale, 262144), U32.is_eq(scale, 1048576), Mode.of(bin_env), probe)

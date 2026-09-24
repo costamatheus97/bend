@@ -1,8 +1,9 @@
 # Simulation + raster measurement
 
-This demo measures two dependent GPU turns per frame: update a quadtree of
-particle lists, then rasterize host-binned sprites using the sibling Bend3D
-renderer. It intentionally tests SHADERS.md's warning about two bangs/frame.
+This demo measures dependent GPU turns per frame: update a quadtree of
+particle lists, bin its sprites into 64-px cells, then rasterize them using
+the sibling Bend3D renderer. It intentionally tests SHADERS.md's warning about
+two bangs/frame.
 The fixed scalar attractors make it nbody-shaped, not an all-pairs nbody model.
 
 On this machine the HIP lane only finds the card with:
@@ -24,6 +25,21 @@ Run `/tmp/particles --gpu 3GB` for the window; Esc closes it.
 warmup frames, without opening a window.
 `--gpu off` explicitly selects the CPU pool.
 
+`PARTICLES_BIN` selects where the binning runs; any other value is `host`:
+
+- `host` (default): sim bang, host binning, raster bang. On the HIP lane the
+  host's walk of the world faults the sim bang's writes back.
+- `device`: sim bang, then one bang that bins and rasterizes; last frame's
+  cells are freed inside it, so the host never walks the world or the cells.
+- `fused`: one bang a frame for sim, binning and raster.
+
+All three draw the same pixels and states (the same `Scene.build`). The probe
+prints `bin=<mode>` on its own line; its sim/bin/raster columns are the clock gaps around each
+step, so `device` reports its binning under raster (bin ~0) and `fused` its
+whole frame under raster. Binning forks its merges over the cell quadtree in
+worlds of 65,536 and up (`Pm.m2`): a merge on one lane walked every list at
+the root.
+
 Run `bash demos/app_particles_2d/run_gpu.sh` on the GPU host. It rebuilds,
 checks proofs and runs three interleaved GPU/CPU rounds at each scale, then a
 separate instrumented GPU run. Raw logs and the summary live under
@@ -40,10 +56,8 @@ Stats include warmups and final checksum/teardown traffic; measured stage
 medians exclude warmups. A headless total is compute throughput, not displayed
 FPS: it excludes window presentation and pacing.
 
-A fused variant is omitted: current-frame host binning must run after the sim
-returns and before the raster starts. One device call cannot span that host IO
-boundary. Moving projection/binning onto the device changes the prescribed
-pipeline and violates the guide's host-scene construction advice. Pipelining
+`device` and `fused` go against the guide's host-scene advice on purpose:
+they measure what device binning costs against the host's faults. Pipelining
 rasterization of a previous frame would measure a different dependency.
 
 CPU measurements, validation commands, emitted-C ownership findings and GPU
