@@ -4491,6 +4491,35 @@ INLINE Ring ring_flip(u32 i) {
   return (i % CUBE_T << CUBE_LOG) + i / CUBE_T;
 }
 
+// BEND_TWIN: a sync moves a ring's live slots, [get, put), and no others,
+// so a slot one side wrote and took since the last sync keeps, on the
+// other, the lap of an older write: zero (none) or two laps back, it reads
+// as full to a take that runs between a push's put and its store, which
+// takes a dead task and skips the one pushed. The mend gives each such
+// slot, on the other side, its lap and no task, so on both sides a slot
+// not live holds the lap of its last push, or zero if none (the corpus and
+// the twin start zero), as the lap check needs. ring_taken: the slots ring
+// r took since the sync that left its put at from (of the last RING_LEN
+// pushed), n of them from *lo.
+#if BEND_TWIN
+INLINE u32 ring_taken(Corpus H, Ring r, u32 from, THR u32* lo) {
+  u32 put = a32_load(ring_put(H, r));
+  u32 get = a32_load(ring_get(H, r));
+  u32 w   = put - from < RING_LEN ? put - from : (u32)RING_LEN;
+  *lo = put - w;
+  return get - *lo <= w ? get - *lo : 0;
+}
+
+INLINE u32 ring_mend(Corpus H, Ring r, u32 from) {
+  u32 lo = 0;
+  u32 n  = ring_taken(H, r, from, &lo);
+  for (u32 i = 0; i < n; i += 1) {
+    ((DEV u32*)ring_slot(H, r, lo + i))[1] = ring_lap(lo + i) << 31;
+  }
+  return n;
+}
+#endif
+
 #define ring_pick(b, s, c) ((b) + (s) * (g32_add(c, 1) & (CUBE_T - 1)))
 
 // Task
@@ -4868,6 +4897,17 @@ extern "C" __global__ void bend_dev(Corpus H, u32 pass) {
   }
   dev_cut(e);
 }
+
+#if BEND_TWIN
+// the enter's mend on the twin (see ring_mend): a thread a ring, from[r]
+// its put at the leave
+extern "C" __global__ void ring_mend_dev(Corpus H, const u32* from) {
+  Ring r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r < LANES) {
+    ring_mend(H, r, from[r]);
+  }
+}
+#endif
 
 #endif
 
@@ -5499,6 +5539,7 @@ static u32  gpu_part;
 static u64  gpu_turns, gpu_faults, gpu_dev_ns;
 static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
 static u64  gpu_calls[5][2], gpu_bytes[5][2], gpu_ns[5][2];
+static u64  gpu_mends[2], gpu_mend_ns[2];  // gpu_rings' mend: slots, time
 // gpu_alias's registered pieces (gpu_pin): their ends, ascending, from
 // gpu_lo; gpu_pin_hi the last, 0 with none. gpu_paged: the tracked bytes
 // copied pageable since the last piece. BEND_GPU_PIN=0: gpu_nopin
@@ -5548,6 +5589,11 @@ static void gpu_stats(void) {
         (unsigned long long)(gpu_ns[k][up] / 1000), up ? "," : "\n");
     }
   }
+  fprintf(stderr, "bend: hip   mend up %llu slots %llu us, down %llu slots"
+    " %llu us\n", (unsigned long long)gpu_mends[1],
+    (unsigned long long)(gpu_mend_ns[1] / 1000),
+    (unsigned long long)gpu_mends[0],
+    (unsigned long long)(gpu_mend_ns[0] / 1000));
   fprintf(stderr, "bend: hip   pin %llu MB registered in %llu pieces, %llu"
     " ms; %llu MB pageable since\n",
     (unsigned long long)(gpu_npin ? (gpu_pin_hi - gpu_lo) >> 20 : 0),
@@ -5710,12 +5756,38 @@ static void gpu_copy(u64 lo, u64 hi, bool up) {
   }
 }
 
+// the enter's mend on the twin: from, each ring's put at the leave, goes up
+static void gpu_mend(const u32* from) {
+  static hipFunction_t pso;
+  static u32*          dev;
+  if ((pso == NULL && hipModuleGetFunction(&pso, gpu_lib, "ring_mend_dev")
+    != hipSuccess) || (dev == NULL
+    && hipMalloc((void**)&dev, LANES * 4) != hipSuccess)) {
+    err_fail("cannot load the ring kernel");
+  }
+  if (hipMemcpy(dev, from, LANES * 4, hipMemcpyHostToDevice) != hipSuccess) {
+    err_fail("corpus copy failed");
+  }
+  struct { Corpus mem; u32* from; } args = { gpu_vram, dev };
+  size_t len   = sizeof args;
+  void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+    HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
+  if (hipModuleLaunchKernel(pso, CUBE_G, 1, 1, CUBE_T, 1, 1, 0, NULL, NULL,
+    cfg) != hipSuccess || (gpu_stat && hipDeviceSynchronize() != hipSuccess)) {
+    err_fail("device launch failed");
+  }
+}
+
 // The free-list rows are the device's alone (the host keeps ALC[]) and stay
 // in VRAM. Of the rings only [get, put) is ever read: the counter planes go,
-// and the slot planes some ring has live.
+// and the slot planes some ring has live. Then the mend (see ring_mend):
+// the side the turn ran on is whole, and the other gets the laps of the
+// slots taken since the last sync, where each ring's put was from[r]: the
+// host's at a leave, the twin's (gpu_mend) at an enter.
 static void gpu_rings(bool up) {
-  static u8 live[1u << 17];  // RING_LEN at its widest (CUBE_LOG = 0)
-  Corpus    H = CORPUS;
+  static u8   live[1u << 17];  // RING_LEN at its widest (CUBE_LOG = 0)
+  static u32* from;            // a zero put, as the corpus starts
+  Corpus      H = CORPUS;
   gpu_copy(RING_OFF + RING_LEN * LANES, RING_OFF + (RING_LEN + 2) * LANES, up);
   memset(live, 0, RING_LEN);
   for (u32 r = 0; r < LANES; r += 1) {
@@ -5733,6 +5805,23 @@ static void gpu_rings(bool up) {
     }
     gpu_copy(RING_OFF + lo * LANES, RING_OFF + w * LANES, up);
   }
+  u64 t0 = gpu_stat ? io_tick() : 0;
+  u64 n  = 0;
+  if (from == NULL && (from = calloc(LANES, 4)) == NULL) {
+    err_fail("corpus reservation failed");
+  }
+  for (u32 r = 0; r < LANES; r += 1) {
+    u32 lo = 0;
+    n += up ? ring_taken(H, r, from[r], &lo) : ring_mend(H, r, from[r]);
+  }
+  if (up && n != 0) {
+    gpu_mend(from);
+  }
+  for (u32 r = 0; r < LANES; r += 1) {
+    from[r] = a32_load(ring_put(H, r));
+  }
+  gpu_mends[up] += n;
+  gpu_mend_ns[up] += gpu_stat ? io_tick() - t0 : 0;
 }
 
 // The leave's plan for tracked chunk c < n (OPTIONS-DESIGN.md §3.3): bit
