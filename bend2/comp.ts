@@ -5753,7 +5753,9 @@ static void gpu_load(u64 bytes) {
 // flushed piece stays put until the device has run it; one that overflows
 // it waits, then doubles it up to GPU_STAGE_CAP. The pass's end waits,
 // and a leave twice: once what it reads first is down (gpu_sync), and at
-// its end. BATCH=0: every copy is a hipMemcpy.
+// its end. BATCH=0: every copy is a hipMemcpy. Batched, BEND_GPU_STATS
+// times a copy's staging, not its move, which is in the waits: a pass's
+// time includes its header's move down, a leave's its copies'.
 #define GPU_STAGE_MAX (16ull << 20)
 #define GPU_STAGE_CAP (32ull << 20)
 #define GPU_PIECE     2048
@@ -5860,6 +5862,9 @@ static void gpu_stage(u64 a, u64 b, bool up, char* h, char* x) {
 // spans no stale or fetched chunk (gpu_heap). With no piece, one copy.
 static bool gpu_move(u64 a, u64 b, bool up, bool al) {
   bool st = gpu_batch && b - a <= GPU_STAGE_MAX;
+  if (gpu_batch && !st) {  // after the pieces before it
+    gpu_flush(false);
+  }
   while (a < b) {
     u64 e = b, i = 0;
     if (a < gpu_pin_hi) {  // the next edge above a
@@ -6165,9 +6170,14 @@ static void gpu_pin(u64 to) {
   if (fd >= 0) {
     close(fd);
   }
-  void* d = NULL;
-  if (big || hipHostRegister(gpu_alias + at, hi - at, hipHostRegisterMapped)
-    != hipSuccess) {
+  void* d  = NULL;
+  bool  ok = !big && hipHostRegister(gpu_alias + at, hi - at,
+    hipHostRegisterMapped) == hipSuccess;
+  if (ok && hipHostGetDevicePointer(&d, gpu_alias + at, 0) != hipSuccess) {
+    (void)hipHostUnregister(gpu_alias + at);
+    ok = false;
+  }
+  if (!ok) {
     fprintf(stderr, "bend: hip pin %s at %llu of %llu MB (%llu MB"
       " available); the rest stays pageable\n", big ? "stopped" : "failed",
       (unsigned long long)((at - gpu_lo) >> 20),
@@ -6177,9 +6187,6 @@ static void gpu_pin(u64 to) {
     return;
   }
   if (hipDeviceSynchronize() != hipSuccess) {
-    err_fail("device fault");
-  }
-  if (hipHostGetDevicePointer(&d, gpu_alias + at, 0) != hipSuccess) {
     err_fail("device fault");
   }
   gpu_pin_dev[gpu_npin] = (char*)d;
