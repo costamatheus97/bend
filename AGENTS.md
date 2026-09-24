@@ -14,6 +14,8 @@ lines its run must print, and the gates run on the mini cluster.
     bend2/base.bend     the base library
     bend2/bend.lean     the core, mechanized in Lean
     bend2/effs/         one file per IO effect, per backend
+    bend2/lanes/        a GPU lane's C (HIP's) that comp.ts splices into the one
+                        emitted file, as with effs/, only for a build with it
     bend2/pack/         package.json, tsconfig.json, bun.lock
     bend2/docs/         the papers' Typst sources, the film, gen_pins.ts (the
                         record pins on this Mac), gen_charts.ts (the landing

@@ -299,7 +299,7 @@ function cli_emit(book: Bend.Book, out: string): void {
   } else {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend-"));
     const c   = path.join(dir, path.basename(out) + ".c");
-    fs.writeFileSync(c, Comp.compile_book(book));
+    fs.writeFileSync(c, Comp.compile_book(book, gpu_lane() === "hip"));
     try {
       cli_build(out, c);
     } finally {
@@ -342,21 +342,27 @@ function cc_find(gpu: boolean): string {
     + " --install";
 }
 
+// gpu_lane is the lane a `!` program builds with here: Metal on macOS; on
+// Linux CUDA at $CUDA_HOME, else at /usr/local/cuda, its libraries in lib64
+// or, as nix lays them, lib; without CUDA, HIP with ROCm at $ROCM_PATH, else
+// at /opt/rocm; else none (the ! runs on the cores)
+const CUDA = process.env.CUDA_HOME || "/usr/local/cuda";
+const ROCM = process.env.ROCM_PATH || "/opt/rocm";
+function gpu_lane(): "metal" | "cuda" | "hip" | null {
+  return process.platform === "darwin" ? "metal"
+    : fs.existsSync(CUDA + "/include/nvrtc.h") ? "cuda"
+    : fs.existsSync(ROCM + "/include/hip/hiprtc.h") ? "hip" : null;
+}
+
 // cli_build builds the C file at `file` into the binary `bin`. A `!` program
-// builds with the GPU lane and writes its GPU program too (on Linux only with
-// CUDA at $CUDA_HOME, else at /usr/local/cuda, its libraries in lib64 or, as
-// nix lays them, lib; without CUDA, with ROCm at $ROCM_PATH, else at
-// /opt/rocm, for the HIP lane; else the ! runs on the cores). On macOS a
+// builds with gpu_lane's lane and writes its GPU program too. On macOS a
 // program with a framework (#import: a window, audio) builds as Objective-C;
 // on Linux it links the X11 and ALSA libraries it includes.
 function cli_build(bin: string, file: string): void {
   const c     = fs.readFileSync(file, "utf8");
-  const mac   = process.platform === "darwin";
-  const cuda  = process.env.CUDA_HOME || "/usr/local/cuda";
-  const rocm  = process.env.ROCM_PATH || "/opt/rocm";
-  const nv    = fs.existsSync(cuda + "/include/nvrtc.h");
-  const hip   = !mac && !nv && fs.existsSync(rocm + "/include/hip/hiprtc.h");
-  const bangs = !/^#define BANGS\s+0$/m.test(c) && (mac || nv || hip);
+  const lane  = gpu_lane();
+  const mac   = lane === "metal";
+  const bangs = !/^#define BANGS\s+0$/m.test(c) && lane !== null;
   const cc    = cc_find(bangs);
   const objc  = mac && (bangs || /^#import /m.test(c))
     ? ["-x", "objective-c", "-fobjc-arc", "-fmodules"] : [];
@@ -365,11 +371,11 @@ function cli_build(bin: string, file: string): void {
   const cpu = [...objc, "-std=c11", "-O3", file, "-lpthread", "-lm",
     ...libs, "-o", path.resolve(bin)];
   const gpu = mac ? ["-DBEND_METAL=1", ...cpu]
-    : hip ? ["-DBEND_HIP=1", "-D__HIP_PLATFORM_AMD__", "-I" + rocm + "/include",
-      "-L" + rocm + "/lib", "-Wl,-rpath," + rocm + "/lib", ...cpu,
+    : lane === "hip" ? ["-DBEND_HIP=1", "-D__HIP_PLATFORM_AMD__", "-I" + ROCM
+      + "/include", "-L" + ROCM + "/lib", "-Wl,-rpath," + ROCM + "/lib", ...cpu,
       "-lamdhip64", "-lhiprtc"]
-    : ["-DBEND_CUDA=1", "-I" + cuda + "/include", "-L" + cuda + "/lib64",
-      "-L" + cuda + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
+    : ["-DBEND_CUDA=1", "-I" + CUDA + "/include", "-L" + CUDA + "/lib64",
+      "-L" + CUDA + "/lib", ...cpu, "-lcuda", "-lnvrtc"];
   const steps: [string, string[]][] = bangs
     ? [[cc, gpu], [path.resolve(bin), ["--gpu-build"]]] : [[cc, cpu]];
   for (const [cmd, args] of steps) {

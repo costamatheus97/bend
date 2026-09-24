@@ -326,7 +326,7 @@ const OPERATIONS: Record<string, Intr> = Object.setPrototypeOf({
     and: "(o & $2) >>> 0", or: "(o | $2) >>> 0", xor: "(o ^ $2) >>> 0",
     exch: "$2", cmpx: "o === $2 ? $3 : o", fadd: "Math.fround(o + $2)",
   }).map(([k, js]) => ["array_atomic_" + k.replace("cmpx", "cas"), {
-    C:    ["$0", "a32_" + k + "(blk_ptr(e.mem, blk_loc(e.mem, $0),"
+    C:    ["$0", "a32_" + k + "(blk_wptr(e.mem, blk_loc(e.mem, $0),"
       + " blk_at($0, $1, 0)), (u32)$2" + (k === "cmpx" ? ", (u32)$3)" : ")")],
     call: true,
     JS:   "array_rmw($0, $1, (o) => " + js + ")",
@@ -1126,8 +1126,9 @@ function ctr_build(fl: File, k: Bend.Name, exprs: string[],
   const at = fl.spares.findIndex((s) =>
     cls_fit(s.words) === cls_fit(exprs.length));
   const s = at < 0 ? null : fl.spares.splice(at, 1)[0];
+  const re = s && `twin_re(e, ${s.name}, ${exprs.length})`;
   const got = s === null ? alloc
-    : s.z ? `${s.name} >= HEAP_OFF ? ${s.name} : ${alloc}` : s.name;
+    : s.z ? `${s.name} >= HEAP_OFF ? ${re} : ${alloc}` : re;
   return `term_ctr(${cid}, ${node_fill(fl, "nd", got, exprs,
     fl.hot.has(k))})`;
 }
@@ -1671,6 +1672,7 @@ function seg_open(fl: File, name: string, ret: Lay, frame: Seg["frame"],
 // Node
 // ====
 
+// HIP: a store into old memory is marked (twin_re, twin_mark: see Twin)
 function node_fill(fl: File, k: string, alloc: string,
   exprs: string[], shr = false): string {
   const nd = name_local(fl, k);
@@ -3005,7 +3007,7 @@ function compile_segs(fl: File): string {
   }).join("\n\n");
 }
 
-export function compile_book(book: Bend.Book): string {
+export function compile_book(book: Bend.Book, hip = true): string {
   const show = show_main(book);
   const cb = carb_book(book, ["main", ...RUNTIME_ADTS]);
   const facts = () => JSON.stringify([[...cb.own], [...cb.hot],
@@ -3076,7 +3078,8 @@ export function compile_book(book: Bend.Book): string {
   fills[0][1].push(...desc);
   return fills.reduce((src, [mark, parts]) => src.replace(
     new RegExp("^// " + mark + "\\n// " + "=".repeat(mark.length) + "$", "m"),
-    (m) => [m, ...parts].join("\n\n")), TEMPLATE);
+    (m) => [m, ...parts].join("\n\n")),
+    hip && fl.bangs.size !== 0 ? lane_src(TEMPLATE) : TEMPLATE);
 }
 
 // Js
@@ -3351,6 +3354,14 @@ function a32_ops(f: (k: string) => string): string {
     `#define a32_${k}(p, v) ${f(k)}`).join("\n");
 }
 
+// lanes/ holds the HIP lane's C (the fork's: WONTFIX #811 keeps upstream to
+// Metal and CUDA). A book with a ! that may build with HIP gets each file
+// at its "// lanes/<file>" line; any other build never reads lanes/.
+function lane_src(src: string): string {
+  return src.replace(/^\/\/ lanes\/([a-z_]+\.c)\n/gm, (_, f) =>
+    fs.readFileSync(Bend.BEND_DIR + "/lanes/" + f, "utf8"));
+}
+
 const TEMPLATE = String.raw`
 
 // Imports
@@ -3472,6 +3483,14 @@ using namespace metal;
 #endif
 #endif
 #define FAR static __attribute__((noinline))
+
+// HIP's corpus has a twin in VRAM (gpu_vram), from the source, so the
+// device's text and the hiprtc options agree
+#if defined(__HIPCC_RTC__) || (BEND_HIP && !DEVICE)
+#define BEND_TWIN 1
+#else
+#define BEND_TWIN 0
+#endif
 
 // A segment: a case of the device's switch; on the host, a preserve_none
 // function (WL_SIG) left by a musttail call, its words fresh at WL_OPEN.
@@ -3639,6 +3658,8 @@ typedef u32* Cur;
 
 #define H_BUMP       0
 #define H_CAP        1
+#define H_TWIN_HI    2  // BEND_TWIN: the enter's bump as a Loc
+#define H_TWIN_MAP   3  // BEND_TWIN: the write map's Loc, a u32 a chunk
 #define H_CURSOR     LINE
 #define H_ROOT_DONE  (2 * LINE)
 #define H_ERROR_CODE (3 * LINE)
@@ -3909,6 +3930,34 @@ INLINE void bank_push(Corpus H, Cls c, Loc head) {
   UNLOCK(bank_lock);
 }
 
+// Twin
+// ====
+
+// BEND_TWIN: a device store below H_TWIN_HI marks its chunk (a u32 per
+// loc >> TWIN_LOG) for the leave. Every store into old memory needs a
+// mark; BEND_GPU_CHECK=1 finds a missing one. Elsewhere a mark is nothing.
+#define TWIN_LOG 15
+#define TWIN_MAPW(span) (((span) >> (TWIN_LOG + 1)) + 1)  // words
+#if BEND_TWIN && DEVICE
+INLINE void twin_mark(Corpus H, Loc loc, u64 n) {
+  if (loc < H[H_TWIN_HI] && n != 0) {
+    DEV u32* m = (DEV u32*)(H + H[H_TWIN_MAP]);
+    for (u64 c = loc >> TWIN_LOG; c <= (loc + n - 1) >> TWIN_LOG; c += 1) {
+      a32_or(m + c, 1);
+    }
+  }
+}
+
+// the emitter's refill of a spare slot in place: n words from loc
+INLINE Loc twin_re(Env e, Loc loc, u64 n) {
+  twin_mark(e.mem, loc, n);
+  return loc;
+}
+#else
+#define twin_mark(H, loc, n)
+#define twin_re(e, loc, n) (loc)
+#endif
+
 // Heap
 // ====
 
@@ -3976,6 +4025,7 @@ OUTLINE Loc heap_alloc_miss(Env e, Cls cls) {
   }
   ALC_AT(e, cls)  = H[got];
   ALC_LEN(e, cls) = (u64)(n - 1) << cls;
+  twin_mark(H, got, 1ull << cls);
   return got;
 }
 
@@ -3984,6 +4034,7 @@ INLINE Loc heap_alloc(Env e, Cls cls) {
   if (h) {
     ALC_AT(e, cls)   = e.mem[h];
     ALC_LEN(e, cls) -= 1ull << cls;
+    twin_mark(e.mem, h, 1ull << cls);
     return h;
   }
   return heap_alloc_miss(e, cls);
@@ -3993,6 +4044,7 @@ INLINE void heap_free(Env e, Cls cls, Loc loc) {
   if (err_seen(e.mem)) {
     return;
   }
+  twin_mark(e.mem, loc, 1);
   e.mem[loc]       = ALC_AT(e, cls);
   ALC_AT(e, cls)   = loc;
   ALC_LEN(e, cls) += 1ull << cls;
@@ -4075,6 +4127,7 @@ INLINE u64 rfc_view(Env e, Loc r) {
 
 INLINE void rfc_bump(Env e, Loc r, u32 k) {
   u32 c = a32_add(a32_at(e.mem, r), k);
+  twin_mark(e.mem, r, 1);
   if ((c & RFC_CNT) >= RFC_CNT - k) {
     err_post(e.mem, ERR_RFCS);
   }
@@ -4127,6 +4180,7 @@ FAR void term_drop(Env e, Term t) {
       Loc      r = term_loc(t);
       DEV u32* p = a32_at(H, r);
       if ((a32_sub_rel(p, 1) & RFC_CNT) != 1) {
+        twin_mark(H, r, 1);
         t = 0;
       } else {
         a32_acq(p);
@@ -4286,12 +4340,24 @@ INLINE Term blk_read(Corpus H, bool arr, Loc loc, u32 i) {
   return (u64)*blk_ptr(H, loc, i);
 }
 
-INLINE void blk_write(Corpus H, bool arr, Loc loc, u32 i, Term v) {
+// u32 i of a block, marked
+INLINE DEV u32a* blk_wptr(Corpus H, Loc loc, u32 i) {
+  twin_mark(H, loc + (i >> 1), 1);
+  return blk_ptr(H, loc, i);
+}
+
+INLINE void blk_put(Corpus H, bool arr, Loc loc, u32 i, Term v) {
   if (arr) {
     H[loc + i] = v;
   } else {
     *blk_ptr(H, loc, i) = (u32)v;
   }
+}
+
+// array_set and swap (a new writing intrinsic marks too)
+INLINE void blk_write(Corpus H, bool arr, Loc loc, u32 i, Term v) {
+  twin_mark(H, loc + (arr ? i : i >> 1), 1);
+  blk_put(H, arr, loc, i, v);
 }
 
 INLINE u32 blk_at(Term a, U32 i, u32 lgs) {
@@ -4302,6 +4368,7 @@ INLINE Term blk_keep(Env e, Loc at) {
   Term w = e.mem[at];
   Term v = term_keep(e, w);
   if (v != w) {
+    twin_mark(e.mem, at, 1);
     e.mem[at] = v;
   }
   return v;
@@ -4393,7 +4460,7 @@ INLINE Term blk_new(Env e, bool arr, Nat d, u32 lgs, u32 n, THR Term* v) {
     v[j] = w;
   }
   for (u64 i = 0; i < (1ull << c); i += 1) {
-    blk_write(H, arr, l, (u32)i, i % (1u << lgs) < n ? v[i % (1u << lgs)] : 0);
+    blk_put(H, arr, l, (u32)i, i % (1u << lgs) < n ? v[i % (1u << lgs)] : 0);
   }
   return term_blk(arr, c, l);
 }
@@ -4425,6 +4492,31 @@ INLINE void ring_push(Corpus H, Ring r, Term tsk) {
 INLINE Ring ring_flip(u32 i) {
   return (i % CUBE_T << CUBE_LOG) + i / CUBE_T;
 }
+
+// BEND_TWIN: a sync moves only a ring's live slots, [get, put), so a slot
+// one side pushed and took since the last sync keeps an older lap on the
+// other, and reads as full to a take racing a push: a dead task taken, the
+// pushed one lost. The mend writes each such slot's lap (no task) on the
+// other side, so both hold, for a slot not live, the lap of its last push.
+// ring_taken: the n slots from *lo ring r took since its put was from.
+#if BEND_TWIN
+INLINE u32 ring_taken(Corpus H, Ring r, u32 from, THR u32* lo) {
+  u32 put = a32_load(ring_put(H, r));
+  u32 get = a32_load(ring_get(H, r));
+  u32 w   = put - from < RING_LEN ? put - from : (u32)RING_LEN;
+  *lo = put - w;
+  return get - *lo <= w ? get - *lo : 0;
+}
+
+INLINE u32 ring_mend(Corpus H, Ring r, u32 from) {
+  u32 lo = 0;
+  u32 n  = ring_taken(H, r, from, &lo);
+  for (u32 i = 0; i < n; i += 1) {
+    ((DEV u32*)ring_slot(H, r, lo + i))[1] = ring_lap(lo + i) << 31;
+  }
+  return n;
+}
+#endif
 
 #define ring_pick(b, s, c) ((b) + (s) * (g32_add(c, 1) & (CUBE_T - 1)))
 
@@ -4458,6 +4550,8 @@ INLINE Term task_deliver(Corpus H, Term cont, u32 idx, THR Term* v, u32 n) {
     return 0;
   }
   Loc tl = task_tail(cont);
+  twin_mark(H, at, n < WL_RESW ? n : WL_RESW);
+  twin_mark(H, tl + 1, 1);
   if (a32_sub_rel(a32_at(H, tl + 1), 1) == 1) {
     a32_acq(a32_at(H, tl + 1));
     return cont;
@@ -4476,6 +4570,7 @@ INLINE void task_deal(Corpus H, Term join, u32 base, u32 stride, Cur cur) {
   for (u32 i = 0; i < ar; i += 1) {
     Term k = H[loc + i];
     if (term_tag(k) == TAG_TSK) {
+      twin_mark(H, loc + i, 1);
       H[loc + i] = TERM_HOLE;
       Ring to;
       if (stride != 0) {
@@ -4700,6 +4795,7 @@ INLINE void dev_cut(Env e) {
       }
       ALC_AT(e, c)    = e.mem[tail];
       ALC_LEN(e, c)  -= gen;
+      twin_mark(e.mem, tail, 1);
       e.mem[tail]     = 0;
       bank_push(e.mem, c, head);
     }
@@ -4800,6 +4896,8 @@ extern "C" __global__ void bend_dev(Corpus H, u32 pass) {
   dev_cut(e);
 }
 
+// lanes/hip_dev.c
+
 #endif
 
 // Window
@@ -4888,10 +4986,18 @@ static void* pool_mmap(u64 bytes) {
 #if BEND_HIP
 // gpu_fault calls into HIP, so the signal stack is a real one
 #define TRAP_STK (1u << 20)
-static bool gpu_fault(void* addr);
+static bool gpu_fault(void* addr, u32 wr);
 
+// wr: 0 a read, 1 a write, as x86-64 tells (the page fault's error code);
+// elsewhere 2, either: a write on a clean chunk, a read on a stale one
 static void gpu_trap(int sig, siginfo_t* si, void* uc) {
-  if (!gpu_fault(si->si_addr)) {
+#ifdef __x86_64__
+  u32 wr = sig != SIGSEGV
+    || (((ucontext_t*)uc)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+#else
+  u32 wr = 2;
+#endif
+  if (!gpu_fault(si->si_addr, wr)) {
     err_trap(sig);
   }
 }
@@ -5044,7 +5150,7 @@ static void gpu_note(const char* path) {
 #endif
 
 #if !BEND_HIP
-#define gpu_enter()
+#define gpu_enter(k)
 #define gpu_leave()
 #endif
 
@@ -5304,250 +5410,7 @@ static void gpu_pass(u32 f) {
 
 #elif BEND_HIP
 
-// AMD's lane. A Radeon has no migrating managed memory, so the corpus is
-// host memory and gpu_vram its twin on the device, which a ! copies in and
-// out: every Loc is an index, and the host never runs during a device turn.
-static Corpus gpu_vram;
-
-static bool gpu_probe(void) {
-  int n = 0;
-  return hipInit(0) == hipSuccess && hipGetDeviceCount(&n) == hipSuccess
-    && n > 0 && hipSetDevice(gpu_dev) == hipSuccess;
-}
-
-// The twin's heap is lazy. After a device turn a chunk under the bump is
-// stale: no access, until a host touch downloads it and marks it dirty; a
-// turn uploads the dirty ones. The bump cannot say what the host wrote:
-// heap_free and heap_alloc rewrite freed slots under it. A fault fills a
-// chunk through gpu_alias, a second mapping, while the chunk still traps,
-// so no other host thread sees it half filled.
-#define GPU_CHUNK (1ull << 21)
-static u8*   gpu_stale;       // a flag a tracked chunk; 0 is dirty
-static char* gpu_alias;
-static u64   gpu_lo, gpu_hi;  // the tracked bytes of the corpus, whole chunks
-static u32   gpu_fault_lock;
-
-// a fresh mapping is zero; the twin is zeroed as corpus_setup does CUDA's
-static Corpus gpu_map(u64 bytes) {
-  void* v  = NULL;
-  int   fd = memfd_create("bend-corpus", 0);
-  if (fd < 0 || ftruncate(fd, (off_t)bytes) != 0) {
-    err_fail("corpus reservation failed");
-  }
-  void* p = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-    MAP_SHARED | MAP_NORESERVE, fd, 0);
-  void* a = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
-    MAP_SHARED | MAP_NORESERVE, fd, 0);
-  close(fd);
-  if (p == MAP_FAILED || a == MAP_FAILED) {
-    err_fail("corpus reservation failed");
-  }
-  if (hipMalloc(&v, bytes) != hipSuccess
-    || hipMemset(v, 0, STAK_OFF * 8) != hipSuccess
-    || hipDeviceSynchronize() != hipSuccess) {
-    err_fail("device corpus reservation failed");
-  }
-  gpu_vram  = (Corpus)v;
-  gpu_alias = (char*)a;
-  return (Corpus)p;
-}
-
-static bool gpu_make(const char* path) {
-  hipDeviceProp_t props;
-  if (hipGetDeviceProperties(&props, gpu_dev) != hipSuccess) {
-    err_fail("cannot compile the HIP library");
-  }
-  char arch[300];
-  char bag[24];
-  snprintf(arch, sizeof arch, "--offload-arch=%s", props.gcnArchName);
-  snprintf(bag, sizeof bag, "-DCUBE_LOG=%u", CUBE_LOG);
-  const char* opts[] = { arch, bag, "-O3", "-ffp-contract=off" };
-  hiprtcProgram prog;
-  if (hiprtcCreateProgram(&prog, BEND_SRC, "bend.hip", 0, NULL, NULL)
-    != HIPRTC_SUCCESS) {
-    err_fail("cannot compile the HIP library");
-  }
-  if (hiprtcCompileProgram(prog, 4, opts) != HIPRTC_SUCCESS) {
-    size_t n = 0;
-    hiprtcGetProgramLogSize(prog, &n);
-    char* log = calloc(n + 1, 1);
-    if (log != NULL && hiprtcGetProgramLog(prog, log) == HIPRTC_SUCCESS) {
-      fprintf(stderr, "%s\n", log);
-    }
-    err_fail("cannot compile the HIP library");
-  }
-  size_t len = 0;
-  hiprtcGetCodeSize(prog, &len);
-  char* bin = malloc(len);
-  if (bin == NULL || hiprtcGetCode(prog, bin) != HIPRTC_SUCCESS) {
-    err_fail("cannot load the HIP library");
-  }
-  hiprtcDestroyProgram(&prog);
-  u64   key = gpu_hash();
-  FILE* out = path == NULL ? NULL : fopen(path, "wb");
-  bool  ok  = out != NULL && fwrite(&key, 8, 1, out) == 1
-    && fwrite(bin, 1, len, out) == len && fclose(out) == 0;
-  if (hipModuleLoadData(&gpu_lib, bin) != hipSuccess) {
-    err_fail("cannot load the HIP library");
-  }
-  free(bin);
-  return path == NULL || ok;
-}
-
-// the twin is reserved whole: 1 GB, and --gpu 2GB asks for more
-static u64 gpu_span(void) {
-  return 1ull << 30;
-}
-
-static void gpu_load(u64 bytes) {
-  const char* path = gpu_path();
-  int         fd   = open(path, O_RDONLY);
-  struct stat st   = { 0 };
-  u64         key  = 0;
-  char*       bin  = fd < 0 || fstat(fd, &st) != 0 || st.st_size <= 8 ? NULL
-    : mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-  if (bin != NULL && bin != MAP_FAILED) {
-    memcpy(&key, bin, 8);
-  }
-  if (key != gpu_hash()
-    || hipModuleLoadData(&gpu_lib, bin + 8) != hipSuccess) {
-    gpu_note(path);
-    gpu_make(path);
-  }
-  if (hipModuleGetFunction(&gpu_pso, gpu_lib, "bend_dev") != hipSuccess) {
-    err_fail("cannot load the GPU program");
-  }
-}
-
-static void gpu_copy(u64 lo, u64 hi, bool up) {
-  if (hi > lo && hipMemcpy(up ? (void*)(gpu_vram + lo) : (void*)(CORPUS + lo),
-    up ? (void*)(CORPUS + lo) : (void*)(gpu_vram + lo), (hi - lo) * 8,
-    up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) != hipSuccess) {
-    err_fail("corpus copy failed");
-  }
-}
-
-// The free-list rows are the device's alone (the host keeps ALC[]) and stay
-// in VRAM. Of the rings only [get, put) is ever read: the counter planes go,
-// and the slot planes some ring has live.
-static void gpu_rings(bool up) {
-  static u8 live[1u << 17];  // RING_LEN at its widest (CUBE_LOG = 0)
-  Corpus    H = CORPUS;
-  gpu_copy(RING_OFF + RING_LEN * LANES, RING_OFF + (RING_LEN + 2) * LANES, up);
-  memset(live, 0, RING_LEN);
-  for (u32 r = 0; r < LANES; r += 1) {
-    u32 get = a32_load(ring_get(H, r));
-    u32 n   = a32_load(ring_put(H, r)) - get;
-    n = n < RING_LEN ? n : (u32)RING_LEN;
-    for (u32 i = 0; i < n; i += 1) {
-      live[(get + i) & (RING_LEN - 1)] = 1;
-    }
-  }
-  for (u64 w = 0; w < RING_LEN; w += 1) {
-    u64 lo = w;
-    while (w < RING_LEN && live[w]) {
-      w += 1;
-    }
-    gpu_copy(RING_OFF + lo * LANES, RING_OFF + w * LANES, up);
-  }
-}
-
-// The static image and the heap up to the word end. The tracked chunks are
-// the whole ones within the heap; what lies outside them goes eagerly.
-static void gpu_heap(u64 end, bool up) {
-  Corpus H = CORPUS;
-  if (gpu_stale == NULL) {
-    u64 cap = a32_load(a32_at(H, H_CAP));
-    gpu_lo = (HEAP_OFF * 8 + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
-    gpu_hi = ((HEAP_OFF + (cap << PAGE_BITS)) * 8) & ~(GPU_CHUNK - 1);
-    gpu_hi = gpu_hi < gpu_lo ? gpu_lo : gpu_hi;
-    gpu_stale = calloc((gpu_hi - gpu_lo) / GPU_CHUNK + 1, 1);
-    if (gpu_stale == NULL) {
-      err_fail("corpus reservation failed");
-    }
-  }
-  u64 e  = end * 8;
-  u64 te = e < gpu_lo ? gpu_lo : e > gpu_hi ? gpu_hi
-    : (e + GPU_CHUNK - 1) & ~(GPU_CHUNK - 1);
-  gpu_copy(STAT_OFF, (e < gpu_lo ? e : gpu_lo) / 8, up);
-  if (e > gpu_hi) {
-    gpu_copy(gpu_hi / 8, end, up);
-  }
-  u64 n = (te - gpu_lo) / GPU_CHUNK;
-  for (u64 c = 0; up && c < n; c += 1) {
-    u64 lo = c;
-    while (c < n && !gpu_stale[c]) {
-      c += 1;
-    }
-    gpu_copy((gpu_lo + lo * GPU_CHUNK) / 8, (gpu_lo + c * GPU_CHUNK) / 8, up);
-  }
-  if (!up && n != 0) {
-    LOCK(gpu_fault_lock);
-    if (mprotect((char*)H + gpu_lo, te - gpu_lo, PROT_NONE) != 0) {
-      err_fail("corpus protection failed");
-    }
-    memset(gpu_stale, 1, n);
-    UNLOCK(gpu_fault_lock);
-  }
-}
-
-static bool gpu_fault(void* addr) {
-  u64 off = (u64)((char*)addr - (char*)CORPUS);
-  if (gpu_stale == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
-    || off >= gpu_hi) {
-    return false;
-  }
-  u64  c  = (off - gpu_lo) / GPU_CHUNK;
-  u64  at = gpu_lo + c * GPU_CHUNK;
-  bool ok = true;
-  LOCK(gpu_fault_lock);
-  if (gpu_stale[c]) {
-    ok = hipMemcpy(gpu_alias + at, (char*)gpu_vram + at, GPU_CHUNK,
-      hipMemcpyDeviceToHost) == hipSuccess
-      && mprotect((char*)CORPUS + at, GPU_CHUNK, PROT_READ | PROT_WRITE) == 0;
-    gpu_stale[c] = !ok;
-  }
-  UNLOCK(gpu_fault_lock);
-  return ok;
-}
-
-// what a turn can touch, but the lanes' stacks; down, the header leads
-static void gpu_sync(bool up) {
-  Corpus H = CORPUS;
-  gpu_copy(0, ALC_OFF, up);
-  gpu_rings(up);
-  gpu_heap(HEAP_OFF + (((u64)a32_load(a32_at(H, H_BUMP)) + 1) << PAGE_BITS),
-    up);
-  for (Cls c = 0; c < NCLS_ALL; c += 1) {
-    Bank* b = bank_at(H, c);
-    u32   n = b->wr > b->rd ? b->wr : b->rd;
-    n = b->top > n ? b->top : n;
-    gpu_copy(b->off, b->off + n + 1, up);
-  }
-}
-
-#define gpu_enter() gpu_sync(true)
-#define gpu_leave() gpu_sync(false)
-
-static void gpu_kernel(u32 pass, u32 groups) {
-  struct { Corpus mem; u32 pass; } args = { gpu_vram, pass };
-  size_t len   = sizeof args;
-  void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
-    HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
-  if (hipModuleLaunchKernel(gpu_pso, groups, 1, 1, CUBE_T, 1, 1, TG_HOLD * 8,
-    NULL, NULL, cfg) != hipSuccess) {
-    err_fail("device launch failed");
-  }
-}
-
-static void gpu_pass(u32 f) {
-  gpu_copy(0, ALC_OFF, true);
-  gpu_run(f);
-  if (hipDeviceSynchronize() != hipSuccess) {
-    err_fail("device fault");
-  }
-  gpu_copy(0, ALC_OFF, false);
-}
+// lanes/hip.c
 
 #else
 
@@ -5619,9 +5482,12 @@ static void* corpus_map(u64 size) {
   return p;
 }
 
+// BEND_TWIN: the write map (a u32 a chunk of the span) past the banks
 static void corpus_lay(Corpus H, u64 size) {
   u64 span = size / 8;
-  u64 cap  = span > HEAP_OFF ? (span - HEAP_OFF) / (PAGE_LEN + 10) : 0;
+  u64 mw   = BEND_TWIN ? TWIN_MAPW(span) : 0;
+  u64 cap  = span > HEAP_OFF + mw ? (span - HEAP_OFF - mw) / (PAGE_LEN + 10)
+    : 0;
   if (cap <= CUBE) {
     err_fail("the GPU span is under the rings, stacks and a page per lane");
   }
@@ -5632,6 +5498,12 @@ static void corpus_lay(Corpus H, u64 size) {
     memcpy(H + at, H + b->off, b->wr * sizeof(u64));
     b->off  = at;
     at     += 2 * (cap >> ((c < NCLS ? NCLS : c) - PAGE_BITS));
+  }
+  if (at + mw > span) {
+    err_fail("the corpus layout overflows its span");
+  }
+  if (BEND_TWIN) {
+    H[H_TWIN_MAP] = at;  // fresh pages: zero (the twin's: gpu_heap)
   }
   corpus_size = size;
   a32_store_rel(a32_at(H, H_CAP), (u32)cap);
@@ -5699,7 +5571,7 @@ OUTLINE Term corpus_eval(Corpus H, Term t) {
         H[tl]     = TERM_HOLE;
         a32_store(a32_at(H, H_CURSOR), 1);
         ring_push(H, 0, t);
-        gpu_enter();
+        gpu_enter((u32)term_aux(t));
         cube_run(H, true);
         gpu_leave();
         Term p = task_deliver(H, cont, idx, rv, root_take(H, rv));
