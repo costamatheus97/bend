@@ -4496,9 +4496,11 @@ INLINE Ring ring_flip(u32 i) {
 // other, the lap of an older write: zero (none) or two laps back, it reads
 // as full to a take that runs between a push's put and its store, which
 // takes a dead task and skips the one pushed. The mend gives each such
-// slot, on the other side, its lap and no task, so on both sides a slot
-// not live holds the lap of its last push, or zero if none (the corpus and
-// the twin start zero), as the lap check needs. ring_taken: the slots ring
+// slot, on the other side, a high word of its lap and no task (a leave's
+// batched row may bring the device's back, with the dead task's bits: the
+// lap is the same), so on both sides a slot not live holds the lap of its
+// last push, or zero if none (the corpus and the twin start zero), as the
+// lap check needs. ring_taken: the slots ring
 // r took since the sync that left its put at from (of the last RING_LEN
 // pushed), n of them from *lo.
 #if BEND_TWIN
@@ -4905,6 +4907,24 @@ extern "C" __global__ void ring_mend_dev(Corpus H, const u32* from) {
   Ring r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r < LANES) {
     ring_mend(H, r, from[r]);
+  }
+}
+
+// a flush's pieces (see gpu_stage), 3 words each: the twin's word, the
+// host side's address as the device sees it (bit 63: up), the words; a
+// group a piece
+extern "C" __global__ void gpu_move_dev(Corpus H, const u64* tab, u32 n) {
+  for (u32 i = blockIdx.x; i < n; i += gridDim.x) {
+    u64* x  = (u64*)(tab[3 * i + 1] & ~(1ull << 63));
+    u64  v  = tab[3 * i];
+    bool up = tab[3 * i + 1] >> 63;
+    for (u64 j = threadIdx.x; j < tab[3 * i + 2]; j += blockDim.x) {
+      if (up) {
+        H[v + j] = x[j];
+      } else {
+        x[j] = H[v + j];
+      }
+    }
   }
 }
 #endif
@@ -5540,6 +5560,8 @@ static u64  gpu_turns, gpu_faults, gpu_dev_ns;
 static u64  gpu_wrote, gpu_writes, gpu_served, gpu_sent;
 static u64  gpu_calls[5][2], gpu_bytes[5][2], gpu_ns[5][2];
 static u64  gpu_mends[2], gpu_mend_ns[2];  // gpu_rings' mend: slots, time
+static u64  gpu_flushes, gpu_waits;         // gpu_flush's kernels and waits
+static bool gpu_batch;                      // BEND_GPU_BATCH (see gpu_stage)
 // gpu_alias's registered pieces (gpu_pin): their ends, ascending, from
 // gpu_lo; gpu_pin_hi the last, 0 with none. gpu_paged: the tracked bytes
 // copied pageable since the last piece. BEND_GPU_PIN=0: gpu_nopin
@@ -5590,10 +5612,12 @@ static void gpu_stats(void) {
     }
   }
   fprintf(stderr, "bend: hip   mend up %llu slots %llu us, down %llu slots"
-    " %llu us\n", (unsigned long long)gpu_mends[1],
+    " %llu us; batch %llu moves, %llu waits\n",
+    (unsigned long long)gpu_mends[1],
     (unsigned long long)(gpu_mend_ns[1] / 1000),
     (unsigned long long)gpu_mends[0],
-    (unsigned long long)(gpu_mend_ns[0] / 1000));
+    (unsigned long long)(gpu_mend_ns[0] / 1000),
+    (unsigned long long)gpu_flushes, (unsigned long long)gpu_waits);
   fprintf(stderr, "bend: hip   pin %llu MB registered in %llu pieces, %llu"
     " ms; %llu MB pageable since\n",
     (unsigned long long)(gpu_npin ? (gpu_pin_hi - gpu_lo) >> 20 : 0),
@@ -5709,8 +5733,124 @@ static void gpu_load(u64 bytes) {
     && strcmp(getenv("BEND_GPU_CHECK"), "0") != 0;
   gpu_nopin = getenv("BEND_GPU_PIN") != NULL
     && atoi(getenv("BEND_GPU_PIN")) == 0;
+  gpu_batch = getenv("BEND_GPU_BATCH") == NULL
+    || atoi(getenv("BEND_GPU_BATCH")) != 0;
   if (gpu_stat) {
     atexit(gpu_stats);
+  }
+}
+
+// BEND_GPU_BATCH=1 (the default): a HIP call costs ~0.1 ms here (WSL2), and
+// a copy of 32 KB or more the same even async, whatever its size, so a
+// turn that made ~30 paid ~3 ms. Instead a copy of up to GPU_STAGE_MAX is
+// a piece of a flush, which moves them all with one kernel (gpu_move_dev)
+// that reads or writes the host side itself: in gpu_alias's registered
+// pieces, else in a pinned buffer (hipHostMalloc) that a copy up fills at
+// the call (the host's bytes then, as a hipMemcpy's) and a flush that
+// waits spreads down into gpu_alias, which never traps. So a registered
+// piece's copy up is read when the kernel runs, and every copy down lands
+// at the wait. The buffer fills from 0 and empties only at a wait, so a
+// flushed piece stays put until the device has run it; one that overflows
+// it waits, then doubles it up to GPU_STAGE_CAP. The pass's end waits,
+// and a leave twice: once what it reads first is down (gpu_sync), and at
+// its end. BATCH=0: every copy is a hipMemcpy.
+#define GPU_STAGE_MAX (16ull << 20)
+#define GPU_STAGE_CAP (32ull << 20)
+#define GPU_PIECE     2048
+typedef struct {
+  char* h;
+  u64   s, n;
+} GpuOut;
+static u64*          gpu_at_buf;   // the pinned buffer
+static u64*          gpu_at_dev;   // as the device sees it
+static u64           gpu_cap;      // its words
+static u64           gpu_used;     // its words in use, since the last wait
+static u64*          gpu_tab;      // the pieces, 3 words each
+static u32           gpu_tabs;
+static GpuOut*       gpu_outs;     // the downs to spread at a wait
+static u32           gpu_nout;
+static char**        gpu_pin_dev;  // a registered piece's start, the device's
+static hipFunction_t gpu_mover;
+
+static void gpu_flush(bool wait) {
+  if (gpu_tabs != 0) {
+    u64* t = gpu_at_buf + gpu_used;
+    memcpy(t, gpu_tab, gpu_tabs * 24);
+    struct { Corpus mem; u64* tab; u32 n; } args = { gpu_vram,
+      gpu_at_dev + gpu_used, gpu_tabs };
+    size_t len   = sizeof args;
+    void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
+      HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
+    if (hipModuleLaunchKernel(gpu_mover, gpu_tabs < 1024 ? gpu_tabs : 1024,
+      1, 1, 256, 1, 1, 0, NULL, NULL, cfg) != hipSuccess) {
+      err_fail("device launch failed");
+    }
+    gpu_used += 3 * gpu_tabs;
+    gpu_tabs  = 0;
+    gpu_flushes += 1;
+  }
+  if (wait && gpu_used != 0) {
+    if (hipDeviceSynchronize() != hipSuccess) {
+      err_fail("device fault");
+    }
+    for (u32 i = 0; i < gpu_nout; i += 1) {
+      memcpy(gpu_outs[i].h, gpu_at_buf + gpu_outs[i].s, gpu_outs[i].n);
+    }
+    gpu_nout = 0;
+    gpu_used = 0;
+    gpu_waits += 1;
+  }
+}
+
+// n words more of the buffer and k pieces more: the word they start at
+static u64 gpu_room(u64 n, u64 k) {
+  if (gpu_used + n + 3 * (gpu_tabs + k) > gpu_cap) {
+    gpu_flush(true);
+    u64   w = gpu_cap == 0 ? 1ull << 19
+      : gpu_cap < GPU_STAGE_CAP / 8 ? 2 * gpu_cap : gpu_cap;
+    void* d = NULL;
+    while (w < n + 3 * k) {
+      w *= 2;
+    }
+    if (w == gpu_cap) {
+      gpu_used += n;
+      return gpu_used - n;
+    }
+    if (hipHostFree(gpu_at_buf) != hipSuccess
+      || hipHostMalloc((void**)&gpu_at_buf, w * 8, 0) != hipSuccess
+      || hipHostGetDevicePointer(&d, gpu_at_buf, 0) != hipSuccess
+      || (gpu_mover == NULL && hipModuleGetFunction(&gpu_mover, gpu_lib,
+        "gpu_move_dev") != hipSuccess)
+      || (gpu_tab = realloc(gpu_tab, w * 8)) == NULL
+      || (gpu_outs = realloc(gpu_outs, w * 8)) == NULL) {
+      err_fail("the staging buffer failed");
+    }
+    gpu_at_dev = (u64*)d;
+    gpu_cap    = w;
+  }
+  gpu_used += n;
+  return gpu_used - n;
+}
+
+// the twin's bytes [a, b), multiples of 8, to or from h, the host's, or
+// if x, the device's address of the same bytes (a registered piece). Only
+// [gpu_lo, gpu_pin_hi) is ever registered, so moves zero-copy: the header,
+// rings, static image, banks and map always stage (pin none below gpu_lo)
+static void gpu_stage(u64 a, u64 b, bool up, char* h, char* x) {
+  u64 n = (b - a) / 8;
+  u64 k = (n + GPU_PIECE - 1) / GPU_PIECE;
+  u64 s = gpu_room(x != NULL ? 0 : n, k);
+  if (x == NULL && up) {
+    memcpy(gpu_at_buf + s, h, b - a);
+  } else if (x == NULL) {
+    gpu_outs[gpu_nout++] = (GpuOut){ h, s, b - a };
+  }
+  x = x != NULL ? x : (char*)(gpu_at_dev + s);
+  for (u64 i = 0; i < n; i += GPU_PIECE) {
+    u64* t = gpu_tab + 3 * gpu_tabs++;
+    t[0] = a / 8 + i;
+    t[1] = (u64)(uintptr_t)(x + i * 8) | (u64)up << 63;
+    t[2] = n - i < GPU_PIECE ? n - i : GPU_PIECE;
   }
 }
 
@@ -5719,6 +5859,7 @@ static void gpu_load(u64 bytes) {
 // piece or when al, else CORPUS. The alias never traps, and an upload
 // spans no stale or fetched chunk (gpu_heap). With no piece, one copy.
 static bool gpu_move(u64 a, u64 b, bool up, bool al) {
+  bool st = gpu_batch && b - a <= GPU_STAGE_MAX;
   while (a < b) {
     u64 e = b, i = 0;
     if (a < gpu_pin_hi) {  // the next edge above a
@@ -5733,7 +5874,11 @@ static bool gpu_move(u64 a, u64 b, bool up, bool al) {
     if (a >= gpu_pin_hi && a >= gpu_lo && a < gpu_hi) {
       GPU_ADD(gpu_paged, e - a);
     }
-    if (hipMemcpy(up ? (char*)gpu_vram + a : h + a,
+    if (st) {
+      char* x = a >= gpu_lo && a < gpu_pin_hi ? gpu_pin_dev[i]
+        + (a - (i != 0 ? gpu_pins[i - 1] : gpu_lo)) : NULL;
+      gpu_stage(a, e, up, gpu_alias + a, x);
+    } else if (hipMemcpy(up ? (char*)gpu_vram + a : h + a,
       up ? h + a : (char*)gpu_vram + a, e - a,
       up ? hipMemcpyHostToDevice : hipMemcpyDeviceToHost) != hipSuccess) {
       return false;
@@ -5761,14 +5906,21 @@ static void gpu_mend(const u32* from) {
   static hipFunction_t pso;
   static u32*          dev;
   if ((pso == NULL && hipModuleGetFunction(&pso, gpu_lib, "ring_mend_dev")
-    != hipSuccess) || (dev == NULL
+    != hipSuccess) || (dev == NULL && !gpu_batch
     && hipMalloc((void**)&dev, LANES * 4) != hipSuccess)) {
     err_fail("cannot load the ring kernel");
   }
-  if (hipMemcpy(dev, from, LANES * 4, hipMemcpyHostToDevice) != hipSuccess) {
+  u32* at = dev;
+  if (gpu_batch) {  // the rings' pieces go first
+    u64 s = gpu_room(LANES / 2, 0);
+    memcpy(gpu_at_buf + s, from, LANES * 4);
+    at = (u32*)(gpu_at_dev + s);
+    gpu_flush(false);
+  } else if (hipMemcpy(dev, from, LANES * 4, hipMemcpyHostToDevice)
+    != hipSuccess) {
     err_fail("corpus copy failed");
   }
-  struct { Corpus mem; u32* from; } args = { gpu_vram, dev };
+  struct { Corpus mem; u32* from; } args = { gpu_vram, at };
   size_t len   = sizeof args;
   void*  cfg[] = { HIP_LAUNCH_PARAM_BUFFER_POINTER, &args,
     HIP_LAUNCH_PARAM_BUFFER_SIZE, &len, HIP_LAUNCH_PARAM_END };
@@ -5788,7 +5940,10 @@ static void gpu_rings(bool up) {
   static u8   live[1u << 17];  // RING_LEN at its widest (CUBE_LOG = 0)
   static u32* from;            // a zero put, as the corpus starts
   Corpus      H = CORPUS;
-  gpu_copy(RING_OFF + RING_LEN * LANES, RING_OFF + (RING_LEN + 2) * LANES, up);
+  if (up) {  // down, gpu_sync brought them
+    gpu_copy(RING_OFF + RING_LEN * LANES, RING_OFF + (RING_LEN + 2) * LANES,
+      true);
+  }
   memset(live, 0, RING_LEN);
   for (u32 r = 0; r < LANES; r += 1) {
     u32 get = a32_load(ring_get(H, r));
@@ -6010,7 +6165,8 @@ static void gpu_pin(u64 to) {
   if (fd >= 0) {
     close(fd);
   }
-  if (big || hipHostRegister(gpu_alias + at, hi - at, hipHostRegisterDefault)
+  void* d = NULL;
+  if (big || hipHostRegister(gpu_alias + at, hi - at, hipHostRegisterMapped)
     != hipSuccess) {
     fprintf(stderr, "bend: hip pin %s at %llu of %llu MB (%llu MB"
       " available); the rest stays pageable\n", big ? "stopped" : "failed",
@@ -6023,7 +6179,11 @@ static void gpu_pin(u64 to) {
   if (hipDeviceSynchronize() != hipSuccess) {
     err_fail("device fault");
   }
-  gpu_pins[gpu_npin++] = hi;
+  if (hipHostGetDevicePointer(&d, gpu_alias + at, 0) != hipSuccess) {
+    err_fail("device fault");
+  }
+  gpu_pin_dev[gpu_npin] = (char*)d;
+  gpu_pins[gpu_npin++]  = hi;
   gpu_pin_hi  = hi;
   gpu_pin_ns += io_tick() - t0;
   gpu_paged   = 0;
@@ -6056,8 +6216,9 @@ static void gpu_heap(u64 end, u32 way) {
       != hipSuccess) {
       err_fail("corpus reservation failed");
     }
-    gpu_pins = calloc((gpu_hi - gpu_lo) / GPU_PIN_GRAIN + 2, 8);
-    if (gpu_pins == NULL) {
+    gpu_pins    = calloc((gpu_hi - gpu_lo) / GPU_PIN_GRAIN + 2, 8);
+    gpu_pin_dev = calloc((gpu_hi - gpu_lo) / GPU_PIN_GRAIN + 2, 8);
+    if (gpu_pins == NULL || gpu_pin_dev == NULL) {
       err_fail("corpus reservation failed");
     }
   }
@@ -6098,6 +6259,7 @@ static void gpu_heap(u64 end, u32 way) {
     c = hi;
   }
   if (way == 1 && gpu_check) {
+    gpu_flush(true);
     for (u64 c = 0; c < n; c += 1) {
       if (gpu_state[c] != GPU_STALE) {
         gpu_k(c, gpu_hi, false, true);
@@ -6117,7 +6279,9 @@ static void gpu_heap(u64 end, u32 way) {
   // Plain stores, no lock: no host thread runs during a turn (see gpu_fault)
   if (!up) {
     // the marks of the tracked chunks, by absolute chunk in the map
-    if (n != 0 && hipMemcpy(gpu_mk, (char*)gpu_vram + m
+    if (gpu_batch) {
+      memcpy(gpu_mk, gpu_alias + m + gpu_lo / GPU_CHUNK * 4, n * 4);
+    } else if (n != 0 && hipMemcpy(gpu_mk, (char*)gpu_vram + m
       + gpu_lo / GPU_CHUNK * 4, n * 4, hipMemcpyDeviceToHost) != hipSuccess) {
       err_fail("corpus copy failed");
     }
@@ -6128,8 +6292,8 @@ static void gpu_heap(u64 end, u32 way) {
     }
     gpu_fetch(n);
     // the whole map (4 bytes a chunk): a mark may run past H_TWIN_HI
-    if (hipMemset((char*)gpu_vram + m, 0, TWIN_MAPW(corpus_size / 8) * 8)
-      != hipSuccess) {
+    if (hipMemsetAsync((char*)gpu_vram + m, 0, TWIN_MAPW(corpus_size / 8)
+      * 8, NULL) != hipSuccess) {
       err_fail("corpus copy failed");
     }
   }
@@ -6144,10 +6308,12 @@ static void gpu_heap(u64 end, u32 way) {
 // dirty, with no lock: no bytes move, two writers make the same change.
 // Anything else trapped while the chunk was stale and another thread
 // served it. Unlocked, as the leave's stores are, this needs what holds
-// today: no host thread touches the corpus in gpu_enter, gpu_leave or
-// gpu_show, and the uploader sees the flags and bytes through the pool's
-// barrier (pool_done, released in pool_work, acquired in pool_turn). An
-// async turn must restore that.
+// today: no host thread touches the corpus from gpu_enter to the first
+// pass's wait (gpu_pass's gpu_flush(true): batched, a registered piece's
+// copy up is read when the mover runs, and a copy down lands at the wait),
+// in gpu_leave or in gpu_show, and the uploader sees the flags and bytes
+// through the pool's barrier (pool_done, released in pool_work, acquired
+// in pool_turn). An async turn must restore that.
 static bool gpu_fault(void* addr, u32 wr) {
   u64 off = (u64)((char*)addr - (char*)CORPUS);
   if (gpu_state == NULL || (char*)addr < (char*)CORPUS || off < gpu_lo
@@ -6225,6 +6391,16 @@ static void gpu_sync(bool up) {
   gpu_part = 0;
   gpu_copy(0, ALC_OFF, up);
   gpu_part = 1;
+  if (!up) {  // what a leave reads first: the rings' counters, the marks
+    gpu_copy(RING_OFF + RING_LEN * LANES, RING_OFF + (RING_LEN + 2) * LANES,
+      false);
+    if (gpu_batch && gpu_state != NULL) {  // for gpu_heap
+      u64 m = H[H_TWIN_MAP] * 8 + gpu_lo / GPU_CHUNK * 4;
+      u64 n = (gpu_hi - gpu_lo) / GPU_CHUNK;
+      gpu_move(m & ~7ull, (m + n * 4 + 7) & ~7ull, false, true);
+    }
+    gpu_flush(true);
+  }
   gpu_rings(up);
   gpu_part = 2;
   gpu_heap(HEAP_OFF + (((u64)a32_load(a32_at(H, H_BUMP)) + 1) << PAGE_BITS),
@@ -6239,6 +6415,7 @@ static void gpu_sync(bool up) {
     }
   }
   gpu_part = 0;
+  gpu_flush(!up);
   if (!up && gpu_stat) {
     gpu_at->leave_ns += io_tick() - t0;  // gpu_heap's fetch set gpu_at
   }
@@ -6260,13 +6437,15 @@ static void gpu_kernel(u32 pass, u32 groups) {
 
 static void gpu_pass(u32 f) {
   gpu_copy(0, ALC_OFF, true);
+  gpu_flush(false);
   u64 t0 = gpu_stat ? io_tick() : 0;
   gpu_run(f);
-  if (hipDeviceSynchronize() != hipSuccess) {
+  if (!gpu_batch && hipDeviceSynchronize() != hipSuccess) {
     err_fail("device fault");
   }
-  gpu_dev_ns += gpu_stat ? io_tick() - t0 : 0;
   gpu_copy(0, ALC_OFF, false);
+  gpu_flush(true);
+  gpu_dev_ns += gpu_stat ? io_tick() - t0 : 0;
 }
 
 // Window.frame's fill on the device: the image's chunks go up if the host
@@ -6295,6 +6474,7 @@ static void gpu_show(Term image, u32 w, u32 h, u32 k, u32* pix) {
     + (((u64)a32_load(a32_at(CORPUS, H_BUMP)) + 1) << PAGE_BITS), 2);
   gpu_part = 0;
   gpu_sent = sent;
+  gpu_flush(false);
   args.mem  = gpu_vram;
   args.root = image;
   args.w    = w;
